@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+#
+# gh-merge — Merge GitHub pull requests locally, à la gh-elao merge.
+#
+# Usage:
+#   gh-merge <PR_NUMBER> [OPTIONS]
+#
+# Options:
+#   -s, --switch <branch>   Merge into a different branch than the PR's base
+#   --no-commit             Merge but don't commit (inspect/tweak first)
+#   --no-thanks             Skip the "thank the author" suggestion
+#   --force-squash          Force squash even with multiple authors
+#   -h, --help              Show this help
+#
+# Requirements: gh (GitHub CLI), git, jq
+
+set -euo pipefail
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+info()  { echo -e "${CYAN}▸${RESET} $*"; }
+ok()    { echo -e "${GREEN}✔${RESET} $*"; }
+warn()  { echo -e "${YELLOW}⚠${RESET} $*"; }
+error() { echo -e "${RED}✖${RESET} $*" >&2; }
+die()   { error "$@"; exit 1; }
+
+ask_yes_no() {
+    local prompt="$1" default="${2:-y}"
+    local yn
+    if [[ "$default" == "y" ]]; then
+        prompt="$prompt [Y/n] "
+    else
+        prompt="$prompt [y/N] "
+    fi
+    read -rp "$(echo -e "${YELLOW}?${RESET} $prompt")" yn
+    yn="${yn:-$default}"
+    [[ "$yn" =~ ^[Yy] ]]
+}
+
+usage() {
+    cat <<'EOF'
+Usage: gh-merge <PR_NUMBER> [OPTIONS]
+
+Merges a GitHub pull request locally with a clean commit message.
+
+Options:
+  -s, --switch <branch>   Merge into a different branch than the PR's base
+  --no-commit             Merge but don't commit (inspect/tweak first)
+  --no-thanks             Skip the "thank the author" suggestion
+  --force-squash          Force squash even with multiple authors
+  -h, --help              Show this help
+
+Examples:
+  gh-merge 42
+  gh-merge 42 --switch=main
+  gh-merge 42 --no-commit
+EOF
+    exit 0
+}
+
+# ─── Detect remote ───────────────────────────────────────────────────────────
+
+get_remote() {
+    local remote
+    # 1. GH_REMOTE env var
+    remote="${GH_REMOTE:-}"
+    [[ -n "$remote" ]] && echo "$remote" && return
+    # 2. git config gh.remote
+    remote="$(git config --get gh.remote 2>/dev/null || true)"
+    [[ -n "$remote" ]] && echo "$remote" && return
+    # 3. Default to origin
+    echo "origin"
+}
+
+# ─── Get repo owner/name from remote ────────────────────────────────────────
+
+get_repo_slug() {
+    local remote="$1"
+    local url
+    url="$(git remote get-url "$remote" 2>/dev/null)" || die "Remote '$remote' not found"
+
+    # Handle SSH: git@github.com:owner/repo.git
+    if [[ "$url" =~ git@github\.com:([^/]+)/([^/.]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    # Handle HTTPS: https://github.com/owner/repo.git
+    elif [[ "$url" =~ github\.com/([^/]+)/([^/.]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    else
+        die "Cannot parse GitHub repo from remote URL: $url"
+    fi
+}
+
+# ─── Parse arguments ────────────────────────────────────────────────────────
+
+PR_NUMBER=""
+SWITCH_BRANCH=""
+NO_COMMIT=false
+NO_THANKS=false
+FORCE_SQUASH=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        -s|--switch)
+            SWITCH_BRANCH="$2"; shift 2 ;;
+        --switch=*)
+            SWITCH_BRANCH="${1#*=}"; shift ;;
+        --no-commit)
+            NO_COMMIT=true; shift ;;
+        --no-thanks)
+            NO_THANKS=true; shift ;;
+        --force-squash)
+            FORCE_SQUASH=true; shift ;;
+        -*)
+            die "Unknown option: $1" ;;
+        *)
+            [[ -n "$PR_NUMBER" ]] && die "Unexpected argument: $1"
+            PR_NUMBER="$1"; shift ;;
+    esac
+done
+
+[[ -z "$PR_NUMBER" ]] && die "Missing required argument: PR number. Run gh-merge --help for usage."
+[[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be a positive integer, got: $PR_NUMBER"
+
+# ─── Prerequisites ───────────────────────────────────────────────────────────
+
+command -v gh  >/dev/null || die "gh (GitHub CLI) is required. Install: https://cli.github.com"
+command -v jq  >/dev/null || die "jq is required. Install: brew install jq"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository"
+
+REMOTE="$(get_remote)"
+REPO="$(get_repo_slug "$REMOTE")"
+
+info "Using remote ${BOLD}$REMOTE${RESET} → ${BOLD}$REPO${RESET}"
+
+# ─── Fetch PR data ──────────────────────────────────────────────────────────
+
+info "Fetching PR #${PR_NUMBER} details…"
+
+PR_JSON="$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null)" \
+    || die "Could not fetch PR #$PR_NUMBER. Is it a valid PR in $REPO?"
+
+PR_TITLE="$(echo "$PR_JSON" | jq -r '.title')"
+PR_STATE="$(echo "$PR_JSON" | jq -r '.state')"
+PR_AUTHOR="$(echo "$PR_JSON" | jq -r '.user.login')"
+PR_HEAD_REF="$(echo "$PR_JSON" | jq -r '.head.ref')"
+PR_HEAD_SHA="$(echo "$PR_JSON" | jq -r '.head.sha')"
+PR_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref')"
+PR_MERGED="$(echo "$PR_JSON" | jq -r '.merged')"
+
+TARGET_BRANCH="${SWITCH_BRANCH:-$PR_BASE_REF}"
+
+echo ""
+echo -e "  ${BOLD}#$PR_NUMBER${RESET} — $PR_TITLE"
+echo -e "  Author:  $PR_AUTHOR"
+echo -e "  Branch:  $PR_HEAD_REF → $TARGET_BRANCH"
+echo -e "  State:   $PR_STATE"
+echo ""
+
+[[ "$PR_MERGED" == "true" ]] && die "PR #$PR_NUMBER is already merged."
+[[ "$PR_STATE" == "closed" ]] && die "PR #$PR_NUMBER is closed (not merged)."
+
+# ─── Fetch commits to determine squash strategy ─────────────────────────────
+
+COMMITS_JSON="$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" 2>/dev/null)"
+COMMIT_COUNT="$(echo "$COMMITS_JSON" | jq 'length')"
+AUTHOR_COUNT="$(echo "$COMMITS_JSON" | jq '[.[].author.login // .[].commit.author.name] | unique | length')"
+
+info "PR has ${BOLD}$COMMIT_COUNT${RESET} commit(s) by ${BOLD}$AUTHOR_COUNT${RESET} author(s)"
+
+# Decide squash strategy
+SQUASH=false
+if [[ "$COMMIT_COUNT" -eq 1 ]]; then
+    SQUASH=true
+elif [[ "$AUTHOR_COUNT" -gt 1 && "$FORCE_SQUASH" == false ]]; then
+    warn "Multiple authors detected. Merge commit will be used (use --force-squash to override)."
+    SQUASH=false
+else
+    if ask_yes_no "Squash $COMMIT_COUNT commits into one?" "y"; then
+        SQUASH=true
+    fi
+fi
+
+# ─── Ensure working tree is clean ───────────────────────────────────────────
+
+if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    die "Working tree is dirty. Please commit or stash your changes first."
+fi
+
+# ─── Fetch and checkout target branch ───────────────────────────────────────
+
+ORIGINAL_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD)"
+
+info "Fetching from ${BOLD}$REMOTE${RESET}…"
+git fetch "$REMOTE" "$TARGET_BRANCH" "$PR_HEAD_REF" 2>/dev/null \
+    || git fetch "$REMOTE" "$TARGET_BRANCH" 2>/dev/null \
+    || die "Could not fetch branch $TARGET_BRANCH from $REMOTE"
+
+# Also fetch the PR head by ref number (works even if the fork branch isn't on the remote)
+git fetch "$REMOTE" "pull/$PR_NUMBER/head:pr-$PR_NUMBER" 2>/dev/null \
+    || die "Could not fetch PR #$PR_NUMBER head"
+
+info "Checking out ${BOLD}$TARGET_BRANCH${RESET}…"
+git checkout "$TARGET_BRANCH" 2>/dev/null || die "Could not checkout $TARGET_BRANCH"
+git reset --hard "$REMOTE/$TARGET_BRANCH" >/dev/null 2>&1
+
+# ─── Build commit message ───────────────────────────────────────────────────
+
+MERGE_MSG="$(printf '%s (#%s)' "$PR_TITLE" "$PR_NUMBER")"
+
+# ─── Merge ───────────────────────────────────────────────────────────────────
+
+if [[ "$SQUASH" == true ]]; then
+    info "Squash-merging PR #$PR_NUMBER…"
+    git merge --squash "pr-$PR_NUMBER" >/dev/null 2>&1 \
+        || die "Merge failed. Resolve conflicts and run: git commit"
+
+    if [[ "$NO_COMMIT" == true ]]; then
+        ok "Squash-merged (no commit). Review with: git diff --cached"
+    else
+        git commit -m "$MERGE_MSG" >/dev/null 2>&1
+        ok "Squash-merged and committed: ${BOLD}$MERGE_MSG${RESET}"
+    fi
+else
+    info "Merge-committing PR #$PR_NUMBER…"
+
+    if [[ "$NO_COMMIT" == true ]]; then
+        git merge --no-ff --no-commit "pr-$PR_NUMBER" >/dev/null 2>&1 \
+            || die "Merge failed. Resolve conflicts and run: git commit"
+        ok "Merged (no commit). Review with: git diff --cached"
+    else
+        git merge --no-ff -m "$MERGE_MSG" "pr-$PR_NUMBER" >/dev/null 2>&1 \
+            || die "Merge failed. Resolve conflicts, then: git commit"
+        ok "Merged and committed: ${BOLD}$MERGE_MSG${RESET}"
+    fi
+fi
+
+# ─── Clean up temp branch ───────────────────────────────────────────────────
+
+git branch -D "pr-$PR_NUMBER" >/dev/null 2>&1 || true
+
+# ─── Post-merge ─────────────────────────────────────────────────────────────
+
+echo ""
+info "Next steps:"
+echo -e "  ${BOLD}git log --oneline -5${RESET}        Review commits"
+echo -e "  ${BOLD}git push $REMOTE $TARGET_BRANCH${RESET}  Push to remote"
+echo ""
+
+if [[ "$NO_THANKS" == false ]]; then
+    if ask_yes_no "Thank @$PR_AUTHOR on the PR?" "y"; then
+        gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            -f body="Thank you @$PR_AUTHOR! 🙏" >/dev/null 2>&1 \
+            && ok "Posted a thank-you comment on PR #$PR_NUMBER" \
+            || warn "Could not post comment (check your token permissions)"
+    fi
+fi
+
+echo ""
+ok "Done! PR #$PR_NUMBER merged into ${BOLD}$TARGET_BRANCH${RESET}."
