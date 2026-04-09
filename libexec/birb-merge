@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-#
-# gh-merge — Merge GitHub pull requests locally, à la gh-elao merge.
+# summary: Merge GitHub pull requests locally
 #
 # Usage:
-#   gh-merge <PR_NUMBER> [OPTIONS]
+#   birb merge <PR_NUMBER> [OPTIONS]
 #
 # Options:
 #   -s, --switch <branch>   Merge into a different branch than the PR's base
@@ -48,7 +47,7 @@ ask_yes_no() {
 
 usage() {
     cat <<'EOF'
-Usage: gh-merge <PR_NUMBER> [OPTIONS]
+Usage: birb merge <PR_NUMBER> [OPTIONS]
 
 Merges a GitHub pull request locally with a clean commit message.
 
@@ -60,9 +59,9 @@ Options:
   -h, --help              Show this help
 
 Examples:
-  gh-merge 42
-  gh-merge 42 --switch=main
-  gh-merge 42 --no-commit
+  birb merge 42
+  birb merge 42 --switch=main
+  birb merge 42 --no-commit
 EOF
     exit 0
 }
@@ -71,13 +70,10 @@ EOF
 
 get_remote() {
     local remote
-    # 1. GH_REMOTE env var
     remote="${GH_REMOTE:-}"
     [[ -n "$remote" ]] && echo "$remote" && return
-    # 2. git config gh.remote
     remote="$(git config --get gh.remote 2>/dev/null || true)"
     [[ -n "$remote" ]] && echo "$remote" && return
-    # 3. Default to origin
     echo "origin"
 }
 
@@ -88,10 +84,8 @@ get_repo_slug() {
     local url
     url="$(git remote get-url "$remote" 2>/dev/null)" || die "Remote '$remote' not found"
 
-    # Handle SSH: git@github.com:owner/repo.git
     if [[ "$url" =~ git@github\.com:([^/]+)/([^/.]+) ]]; then
         echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-    # Handle HTTPS: https://github.com/owner/repo.git
     elif [[ "$url" =~ github\.com/([^/]+)/([^/.]+) ]]; then
         echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
     else
@@ -128,7 +122,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$PR_NUMBER" ]] && die "Missing required argument: PR number. Run gh-merge --help for usage."
+[[ -z "$PR_NUMBER" ]] && die "Missing required argument: PR number. Run birb merge --help for usage."
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be a positive integer, got: $PR_NUMBER"
 
 # ─── Prerequisites ───────────────────────────────────────────────────────────
@@ -259,7 +253,7 @@ echo ""
 if [[ "$NO_THANKS" == false ]]; then
     if ask_yes_no "Thank @$PR_AUTHOR on the PR?" "y"; then
         gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-            -f body="Thank you @$PR_AUTHOR! 🙏" >/dev/null 2>&1 \
+            -f body="Thank you @$PR_AUTHOR!" >/dev/null 2>&1 \
             && ok "Posted a thank-you comment on PR #$PR_NUMBER" \
             || warn "Could not post comment (check your token permissions)"
     fi

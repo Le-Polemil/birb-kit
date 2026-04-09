@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# birb — Personal CLI toolkit.
+#
+# Usage:
+#   birb <command> [args...]
+#   birb help
+#
+# Commands are stored in libexec/birb-* and auto-discovered.
+
+set -euo pipefail
+
+BIRB_VERSION="0.2.0"
+
+# Resolve the real install directory (follows symlinks)
+BIRB_ROOT="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+BIRB_LIBEXEC="$BIRB_ROOT/libexec"
+
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+usage() {
+    cat <<EOF
+${BOLD}birb${RESET} v$BIRB_VERSION — Personal CLI toolkit.
+
+${BOLD}Usage:${RESET}
+  birb <command> [args...]
+
+${BOLD}Commands:${RESET}
+EOF
+    if [[ -d "$BIRB_LIBEXEC" ]]; then
+        for cmd in "$BIRB_LIBEXEC"/birb-*; do
+            [[ -x "$cmd" ]] || continue
+            name="$(basename "$cmd" | sed 's/^birb-//')"
+            desc="$(head -5 "$cmd" | grep '^# summary:' | sed 's/^# summary: *//' || true)"
+            printf "  ${BOLD}%-14s${RESET} %s\n" "$name" "$desc"
+        done
+    fi
+    echo ""
+    echo -e "${BOLD}Run${RESET} birb <command> --help ${BOLD}for details on a command.${RESET}"
+}
+
+if [[ $# -eq 0 ]] || [[ "$1" == "help" ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ "$1" == "--version" ]] || [[ "$1" == "-V" ]]; then
+    echo "birb v$BIRB_VERSION"
+    exit 0
+fi
+
+COMMAND="$1"
+shift
+
+COMMAND_PATH="$BIRB_LIBEXEC/birb-$COMMAND"
+
+if [[ ! -x "$COMMAND_PATH" ]]; then
+    echo -e "${RED}✖${RESET} Unknown command: ${BOLD}$COMMAND${RESET}" >&2
+    echo "" >&2
+    usage >&2
+    exit 1
+fi
+
+exec "$COMMAND_PATH" "$@"

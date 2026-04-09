@@ -1,26 +1,26 @@
-# cli-tools
+# birb-kit
 
-Personal CLI tools collection.
+Personal CLI toolkit.
 
 ## Install
 
 ```bash
-brew install Le-Polemil/tools/cli-tools
+brew install Le-Polemil/tools/birb-kit
 ```
 
 Or manually:
 
 ```bash
-git clone https://github.com/Le-Polemil/cli-tools.git
-cd cli-tools
+git clone https://github.com/Le-Polemil/birb-kit.git
+cd birb-kit
 make install
 ```
 
-## Tools
+## Commands
 
 | Command | Description |
 |---|---|
-| `gh-merge` | Merge GitHub PRs locally with clean commit messages (squash, multi-author support, thank-you comments) |
+| `birb merge <PR>` | Merge GitHub PRs locally with clean commit messages |
 
 ## Requirements
 
@@ -31,8 +31,8 @@ make install
 ## Usage
 
 ```bash
-gh-merge 42                    # Merge PR #42 into its base branch
-gh-merge 42 --switch=main      # Merge into a different branch
-gh-merge 42 --no-commit        # Merge without committing
-gh-merge 42 --force-squash     # Force squash even with multiple authors
+birb merge 42                    # Merge PR #42 into its base branch
+birb merge 42 --switch=main      # Merge into a different branch
+birb merge 42 --no-commit        # Merge without committing
+birb merge 42 --force-squash     # Force squash even with multiple authors
 ```
