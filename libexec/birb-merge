@@ -214,7 +214,7 @@ MERGE_MSG="$(printf '%s (#%s)' "$PR_TITLE" "$PR_NUMBER")"
 # ─── Merge ───────────────────────────────────────────────────────────────────
 
 if [[ "$SQUASH" == true ]]; then
-    info "Squash-merging PR #$PR_NUMBER…"
+    info "Squash-merging PR #${PR_NUMBER}…"
     git merge --squash "pr-$PR_NUMBER" >/dev/null 2>&1 \
         || die "Merge failed. Resolve conflicts and run: git commit"
 
@@ -225,7 +225,7 @@ if [[ "$SQUASH" == true ]]; then
         ok "Squash-merged and committed: ${BOLD}$MERGE_MSG${RESET}"
     fi
 else
-    info "Merge-committing PR #$PR_NUMBER…"
+    info "Merge-committing PR #${PR_NUMBER}…"
 
     if [[ "$NO_COMMIT" == true ]]; then
         git merge --no-ff --no-commit "pr-$PR_NUMBER" >/dev/null 2>&1 \
