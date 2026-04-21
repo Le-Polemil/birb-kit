@@ -17,48 +17,85 @@ set -euo pipefail
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ITALIC='\033[3m'
+
+BLACK='\033[0;30m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+WHITE='\033[0;37m'
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+B_RED='\033[1;31m'
+B_GREEN='\033[1;32m'
+B_YELLOW='\033[1;33m'
+B_BLUE='\033[1;34m'
+B_MAGENTA='\033[1;35m'
+B_CYAN='\033[1;36m'
 
-info()  { echo -e "${CYAN}▸${RESET} $*"; }
-ok()    { echo -e "${GREEN}✔${RESET} $*"; }
-warn()  { echo -e "${YELLOW}⚠${RESET} $*"; }
-error() { echo -e "${RED}✖${RESET} $*" >&2; }
-die()   { error "$@"; exit 1; }
+BRIGHT_BLUE='\033[0;94m'
+BRIGHT_MAGENTA='\033[0;95m'
+BRIGHT_CYAN='\033[0;96m'
+
+BG_BLUE='\033[44m'
+BG_MAGENTA='\033[45m'
+
+# ─── Output helpers ──────────────────────────────────────────────────────────
+
+info()    { echo -e "${CYAN}▸${RESET} $*"; }
+ok()      { echo -e "${B_GREEN}✔${RESET} $*"; }
+warn()    { echo -e "${B_YELLOW}⚠${RESET} $*"; }
+error()   { echo -e "${B_RED}✖${RESET} $*" >&2; }
+die()     { error "$@"; exit 1; }
+q()       { echo -e "${B_MAGENTA}?${RESET} $*"; }
+
+section() {
+    echo ""
+    echo -e "${BOLD}${BRIGHT_BLUE}┌─ $* ${RESET}${DIM}${BLUE}$(printf '─%.0s' $(seq 1 $((60 - ${#1}))))${RESET}"
+}
+
+header() {
+    local title="$1"
+    echo ""
+    echo -e "${BOLD}${B_MAGENTA}  ♢ birb merge${RESET}  ${DIM}— $title${RESET}"
+    echo -e "${DIM}${BLUE}  $(printf '━%.0s' $(seq 1 56))${RESET}"
+}
 
 ask_yes_no() {
     local prompt="$1" default="${2:-y}"
-    local yn
+    local yn hint
     if [[ "$default" == "y" ]]; then
-        prompt="$prompt [Y/n] "
+        hint="${DIM}[Y/n]${RESET}"
     else
-        prompt="$prompt [y/N] "
+        hint="${DIM}[y/N]${RESET}"
     fi
-    read -rp "$(echo -e "${YELLOW}?${RESET} $prompt")" yn
+    read -rp "$(echo -e "${B_MAGENTA}?${RESET} ${BOLD}$prompt${RESET} $hint ")" yn
     yn="${yn:-$default}"
     [[ "$yn" =~ ^[Yy] ]]
 }
 
+# ─── Usage ───────────────────────────────────────────────────────────────────
+
 usage() {
-    cat <<'EOF'
-Usage: birb merge <PR_NUMBER> [OPTIONS]
+    cat <<EOF
+$(echo -e "${BOLD}${B_MAGENTA}birb merge${RESET}") — Merge GitHub pull requests locally.
 
-Merges a GitHub pull request locally with a clean commit message.
+$(echo -e "${BOLD}Usage:${RESET}")
+  birb merge <PR_NUMBER> [OPTIONS]
 
-Options:
+$(echo -e "${BOLD}Options:${RESET}")
   -s, --switch <branch>   Merge into a different branch than the PR's base
   --no-commit             Merge but don't commit (inspect/tweak first)
   --no-thanks             Skip the "thank the author" suggestion
   --force-squash          Force squash even with multiple authors
   -h, --help              Show this help
 
-Examples:
+$(echo -e "${BOLD}Examples:${RESET}")
   birb merge 42
   birb merge 42 --switch=main
   birb merge 42 --no-commit
@@ -66,7 +103,7 @@ EOF
     exit 0
 }
 
-# ─── Detect remote ───────────────────────────────────────────────────────────
+# ─── Remote / repo detection ─────────────────────────────────────────────────
 
 get_remote() {
     local remote
@@ -76,8 +113,6 @@ get_remote() {
     [[ -n "$remote" ]] && echo "$remote" && return
     echo "origin"
 }
-
-# ─── Get repo owner/name from remote ────────────────────────────────────────
 
 get_repo_slug() {
     local remote="$1"
@@ -93,13 +128,264 @@ get_repo_slug() {
     fi
 }
 
-# ─── Parse arguments ────────────────────────────────────────────────────────
+# ─── Conventional commit types ───────────────────────────────────────────────
+
+COMMIT_TYPES=(
+    "feat|New feature"
+    "fix|Bug fix"
+    "docs|Documentation"
+    "security|Security fix"
+    "deps|Dependencies"
+    "refactor|Refactoring"
+    "perf|Performance"
+    "chore|Maintenance"
+    "style|Formatting"
+    "test|Tests"
+    "build|Build system"
+    "ci|CI/CD"
+    "revert|Revert"
+)
+
+select_commit_type() {
+    section "Change type"
+    local i=1 entry key desc
+    for entry in "${COMMIT_TYPES[@]}"; do
+        key="${entry%%|*}"
+        desc="${entry#*|}"
+        printf "  ${B_MAGENTA}%2d)${RESET} ${BOLD}%-10s${RESET} ${DIM}— %s${RESET}\n" "$i" "$key" "$desc"
+        i=$((i+1))
+    done
+    echo ""
+    local choice
+    read -rp "$(echo -e "${B_MAGENTA}?${RESET} ${BOLD}Type${RESET} ${DIM}[1-${#COMMIT_TYPES[@]}, name, or empty to skip]:${RESET} ")" choice
+
+    [[ -z "$choice" ]] && { SELECTED_TYPE=""; return; }
+
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        local idx=$((choice - 1))
+        if [[ "$idx" -ge 0 && "$idx" -lt "${#COMMIT_TYPES[@]}" ]]; then
+            SELECTED_TYPE="${COMMIT_TYPES[$idx]%%|*}"
+            ok "Selected: ${B_MAGENTA}${SELECTED_TYPE}${RESET}"
+            return
+        fi
+    fi
+
+    for entry in "${COMMIT_TYPES[@]}"; do
+        key="${entry%%|*}"
+        if [[ "$key" == "$choice" ]]; then
+            SELECTED_TYPE="$key"
+            ok "Selected: ${B_MAGENTA}${SELECTED_TYPE}${RESET}"
+            return
+        fi
+    done
+
+    warn "Unknown type '$choice', skipping prefix"
+    SELECTED_TYPE=""
+}
+
+# ─── Labels ──────────────────────────────────────────────────────────────────
+
+manage_labels() {
+    section "Labels"
+
+    local current_labels
+    current_labels="$(echo "$PR_JSON" | jq -r '.labels[].name' | sort)"
+
+    if [[ -n "$current_labels" ]]; then
+        echo -e "${DIM}Current labels:${RESET}"
+        local label
+        while IFS= read -r label; do
+            echo -e "  ${B_GREEN}●${RESET} ${GREEN}$label${RESET}"
+        done <<< "$current_labels"
+    else
+        echo -e "${DIM}No labels currently applied.${RESET}"
+    fi
+    echo ""
+
+    ask_yes_no "Modify labels before merge?" "n" || return
+
+    local available
+    available="$(gh api "repos/$REPO/labels?per_page=100" --jq '.[].name' 2>/dev/null | sort)" \
+        || { warn "Could not fetch labels"; return; }
+
+    if [[ -z "$available" ]]; then
+        warn "No labels available in this repo"
+        return
+    fi
+
+    echo ""
+    echo -e "${DIM}Toggle by number (already applied shown with ${B_GREEN}●${RESET}${DIM}):${RESET}"
+    local i=1 label marker
+    local -a labels_arr=()
+    while IFS= read -r label; do
+        labels_arr+=("$label")
+        marker=" "
+        if echo "$current_labels" | grep -qx "$label" 2>/dev/null; then
+            marker="${B_GREEN}●${RESET}"
+        fi
+        printf "  $marker ${B_MAGENTA}%2d)${RESET} %s\n" "$i" "$label"
+        i=$((i+1))
+    done <<< "$available"
+    echo ""
+
+    local choices num idx
+    read -rp "$(echo -e "${B_MAGENTA}?${RESET} ${BOLD}Numbers to toggle${RESET} ${DIM}(space-separated, empty to cancel):${RESET} ")" choices
+    [[ -z "$choices" ]] && return
+
+    for num in $choices; do
+        if [[ "$num" =~ ^[0-9]+$ ]]; then
+            idx=$((num - 1))
+            if [[ "$idx" -ge 0 && "$idx" -lt "${#labels_arr[@]}" ]]; then
+                label="${labels_arr[$idx]}"
+                if echo "$current_labels" | grep -qx "$label" 2>/dev/null; then
+                    gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$label" >/dev/null 2>&1 \
+                        && info "Removed: ${RED}$label${RESET}" \
+                        || warn "Failed to remove: $label"
+                else
+                    gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$label" >/dev/null 2>&1 \
+                        && info "Added: ${GREEN}$label${RESET}" \
+                        || warn "Failed to add: $label"
+                fi
+            fi
+        fi
+    done
+}
+
+# ─── Version bump ────────────────────────────────────────────────────────────
+
+detect_version_kind() {
+    if [[ -f package.json ]] && jq -e '.version' package.json >/dev/null 2>&1; then
+        echo "npm"
+    elif [[ -f composer.json ]] && jq -e '.version' composer.json >/dev/null 2>&1; then
+        echo "composer"
+    elif [[ -f VERSION ]]; then
+        echo "version-file"
+    elif git describe --tags --abbrev=0 >/dev/null 2>&1; then
+        echo "git-tag"
+    else
+        echo "none"
+    fi
+}
+
+get_current_version() {
+    case "$1" in
+        npm)          jq -r '.version // empty' package.json ;;
+        composer)     jq -r '.version // empty' composer.json ;;
+        version-file) tr -d '[:space:]' < VERSION ;;
+        git-tag)      git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' ;;
+    esac
+}
+
+bump_semver() {
+    local version="$1" kind="$2"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$version"
+    major="${major:-0}"; minor="${minor:-0}"; patch="${patch:-0}"
+    # Strip any pre-release suffix
+    patch="${patch%%-*}"
+    case "$kind" in
+        major) echo "$((major+1)).0.0" ;;
+        minor) echo "${major}.$((minor+1)).0" ;;
+        patch) echo "${major}.${minor}.$((patch+1))" ;;
+    esac
+}
+
+apply_version_bump() {
+    local new="$1" kind="$2"
+    case "$kind" in
+        npm)
+            local tmp
+            tmp="$(jq --arg v "$new" '.version = $v' package.json)"
+            echo "$tmp" > package.json
+            git add package.json
+            if [[ -f package-lock.json ]]; then
+                tmp="$(jq --arg v "$new" '.version = $v | (.packages[""].version = $v)' package-lock.json 2>/dev/null)" \
+                    && echo "$tmp" > package-lock.json \
+                    && git add package-lock.json
+            fi
+            ;;
+        composer)
+            local tmp
+            tmp="$(jq --arg v "$new" '.version = $v' composer.json)"
+            echo "$tmp" > composer.json
+            git add composer.json
+            ;;
+        version-file)
+            echo "$new" > VERSION
+            git add VERSION
+            ;;
+    esac
+}
+
+manage_version_bump() {
+    section "Version bump"
+
+    local kind current
+    kind="$(detect_version_kind)"
+
+    if [[ "$kind" == "none" ]]; then
+        info "No version source detected. Skipping."
+        return
+    fi
+
+    current="$(get_current_version "$kind")"
+
+    if [[ -z "$current" ]]; then
+        info "No current version found. Skipping."
+        return
+    fi
+
+    echo -e "${DIM}Project type:${RESET}    ${BOLD}$kind${RESET}"
+    echo -e "${DIM}Current version:${RESET} ${BOLD}${B_MAGENTA}$current${RESET}"
+    echo ""
+
+    local patch_v minor_v major_v
+    patch_v="$(bump_semver "$current" patch)"
+    minor_v="$(bump_semver "$current" minor)"
+    major_v="$(bump_semver "$current" major)"
+
+    echo -e "  ${B_MAGENTA}1)${RESET} ${BOLD}patch${RESET}   ${DIM}→${RESET}  ${GREEN}$patch_v${RESET}    ${DIM}(bug fix)${RESET}"
+    echo -e "  ${B_MAGENTA}2)${RESET} ${BOLD}minor${RESET}   ${DIM}→${RESET}  ${YELLOW}$minor_v${RESET}    ${DIM}(new feature, backwards-compatible)${RESET}"
+    echo -e "  ${B_MAGENTA}3)${RESET} ${BOLD}major${RESET}   ${DIM}→${RESET}  ${RED}$major_v${RESET}    ${DIM}(breaking changes)${RESET}"
+    echo -e "  ${B_MAGENTA}4)${RESET} ${BOLD}custom${RESET}"
+    echo -e "  ${B_MAGENTA}5)${RESET} ${BOLD}skip${RESET}"
+    echo ""
+
+    local choice new_version=""
+    read -rp "$(echo -e "${B_MAGENTA}?${RESET} ${BOLD}Bump${RESET} ${DIM}[1-5, default: 5]:${RESET} ")" choice
+    choice="${choice:-5}"
+
+    case "$choice" in
+        1) new_version="$patch_v" ;;
+        2) new_version="$minor_v" ;;
+        3) new_version="$major_v" ;;
+        4) read -rp "$(echo -e "${B_MAGENTA}?${RESET} ${BOLD}New version:${RESET} ")" new_version ;;
+        *) info "Skipping version bump."; return ;;
+    esac
+
+    [[ -z "$new_version" ]] && { info "No version provided, skipping."; return; }
+
+    if [[ "$kind" != "git-tag" ]]; then
+        apply_version_bump "$new_version" "$kind"
+        git commit -m "chore: bump version to $new_version" >/dev/null
+        ok "Bumped ${kind} to ${BOLD}${B_MAGENTA}$new_version${RESET}"
+    fi
+
+    if ask_yes_no "Create git tag v${new_version}?" "y"; then
+        git tag "v${new_version}" \
+            && ok "Tagged ${BOLD}${B_MAGENTA}v${new_version}${RESET}" \
+            || warn "Could not create tag (already exists?)"
+    fi
+}
+
+# ─── Parse arguments ─────────────────────────────────────────────────────────
 
 PR_NUMBER=""
 SWITCH_BRANCH=""
 NO_COMMIT=false
 NO_THANKS=false
 FORCE_SQUASH=false
+SELECTED_TYPE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -127,137 +413,164 @@ done
 
 # ─── Prerequisites ───────────────────────────────────────────────────────────
 
-command -v gh  >/dev/null || die "gh (GitHub CLI) is required. Install: https://cli.github.com"
-command -v jq  >/dev/null || die "jq is required. Install: brew install jq"
+command -v gh >/dev/null || die "gh (GitHub CLI) is required. Install: https://cli.github.com"
+command -v jq >/dev/null || die "jq is required. Install: brew install jq"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository"
 
 REMOTE="$(get_remote)"
 REPO="$(get_repo_slug "$REMOTE")"
 
-info "Using remote ${BOLD}$REMOTE${RESET} → ${BOLD}$REPO${RESET}"
+header "PR #${PR_NUMBER} on ${REPO}"
 
-# ─── Fetch PR data ──────────────────────────────────────────────────────────
+info "Remote: ${BOLD}$REMOTE${RESET}  ${DIM}→${RESET}  ${BOLD}${BRIGHT_CYAN}$REPO${RESET}"
 
-info "Fetching PR #${PR_NUMBER} details…"
+# ─── Fetch PR data ───────────────────────────────────────────────────────────
+
+info "Fetching PR details…"
 
 PR_JSON="$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null)" \
-    || die "Could not fetch PR #$PR_NUMBER. Is it a valid PR in $REPO?"
+    || die "Could not fetch PR #${PR_NUMBER}. Is it a valid PR in $REPO?"
 
 PR_TITLE="$(echo "$PR_JSON" | jq -r '.title')"
 PR_STATE="$(echo "$PR_JSON" | jq -r '.state')"
 PR_AUTHOR="$(echo "$PR_JSON" | jq -r '.user.login')"
 PR_HEAD_REF="$(echo "$PR_JSON" | jq -r '.head.ref')"
-PR_HEAD_SHA="$(echo "$PR_JSON" | jq -r '.head.sha')"
 PR_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref')"
 PR_MERGED="$(echo "$PR_JSON" | jq -r '.merged')"
 
 TARGET_BRANCH="${SWITCH_BRANCH:-$PR_BASE_REF}"
 
 echo ""
-echo -e "  ${BOLD}#$PR_NUMBER${RESET} — $PR_TITLE"
-echo -e "  Author:  $PR_AUTHOR"
-echo -e "  Branch:  $PR_HEAD_REF → $TARGET_BRANCH"
-echo -e "  State:   $PR_STATE"
-echo ""
+echo -e "  ${BOLD}${B_MAGENTA}#${PR_NUMBER}${RESET}  ${BOLD}$PR_TITLE${RESET}"
+echo -e "  ${DIM}Author:${RESET}  ${BRIGHT_CYAN}@${PR_AUTHOR}${RESET}"
+echo -e "  ${DIM}Branch:${RESET}  ${YELLOW}$PR_HEAD_REF${RESET} ${DIM}→${RESET} ${B_GREEN}$TARGET_BRANCH${RESET}"
+echo -e "  ${DIM}State:${RESET}   ${GREEN}$PR_STATE${RESET}"
 
-[[ "$PR_MERGED" == "true" ]] && die "PR #$PR_NUMBER is already merged."
-[[ "$PR_STATE" == "closed" ]] && die "PR #$PR_NUMBER is closed (not merged)."
+[[ "$PR_MERGED" == "true" ]] && { echo ""; die "PR #${PR_NUMBER} is already merged."; }
+[[ "$PR_STATE" == "closed" ]] && { echo ""; die "PR #${PR_NUMBER} is closed (not merged)."; }
 
-# ─── Fetch commits to determine squash strategy ─────────────────────────────
+# ─── Commits / squash strategy ───────────────────────────────────────────────
 
 COMMITS_JSON="$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" 2>/dev/null)"
 COMMIT_COUNT="$(echo "$COMMITS_JSON" | jq 'length')"
 AUTHOR_COUNT="$(echo "$COMMITS_JSON" | jq '[.[].author.login // .[].commit.author.name] | unique | length')"
 
-info "PR has ${BOLD}$COMMIT_COUNT${RESET} commit(s) by ${BOLD}$AUTHOR_COUNT${RESET} author(s)"
+echo -e "  ${DIM}Commits:${RESET} ${BOLD}$COMMIT_COUNT${RESET} by ${BOLD}$AUTHOR_COUNT${RESET} author(s)"
+
+# ─── Ensure working tree is clean ────────────────────────────────────────────
+
+if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    echo ""
+    die "Working tree is dirty. Please commit or stash your changes first."
+fi
+
+# ─── Interactive prompts ─────────────────────────────────────────────────────
+
+select_commit_type
+manage_labels
 
 # Decide squash strategy
+section "Squash strategy"
 SQUASH=false
 if [[ "$COMMIT_COUNT" -eq 1 ]]; then
+    info "Single commit — will squash by default."
     SQUASH=true
 elif [[ "$AUTHOR_COUNT" -gt 1 && "$FORCE_SQUASH" == false ]]; then
-    warn "Multiple authors detected. Merge commit will be used (use --force-squash to override)."
+    warn "Multiple authors detected. Using merge commit (use --force-squash to override)."
     SQUASH=false
 else
-    if ask_yes_no "Squash $COMMIT_COUNT commits into one?" "y"; then
+    echo -e "${DIM}PR has $COMMIT_COUNT commits.${RESET}"
+    if ask_yes_no "Squash into a single commit?" "y"; then
         SQUASH=true
     fi
 fi
 
-# ─── Ensure working tree is clean ───────────────────────────────────────────
+# ─── Fetch and checkout target branch ────────────────────────────────────────
 
-if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-    die "Working tree is dirty. Please commit or stash your changes first."
-fi
-
-# ─── Fetch and checkout target branch ───────────────────────────────────────
-
-ORIGINAL_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD)"
+section "Preparing branches"
 
 info "Fetching from ${BOLD}$REMOTE${RESET}…"
 git fetch "$REMOTE" "$TARGET_BRANCH" "$PR_HEAD_REF" 2>/dev/null \
     || git fetch "$REMOTE" "$TARGET_BRANCH" 2>/dev/null \
     || die "Could not fetch branch $TARGET_BRANCH from $REMOTE"
 
-# Also fetch the PR head by ref number (works even if the fork branch isn't on the remote)
-git fetch "$REMOTE" "pull/$PR_NUMBER/head:pr-$PR_NUMBER" 2>/dev/null \
-    || die "Could not fetch PR #$PR_NUMBER head"
+git fetch "$REMOTE" "pull/${PR_NUMBER}/head:pr-${PR_NUMBER}" 2>/dev/null \
+    || die "Could not fetch PR #${PR_NUMBER} head"
 
-info "Checking out ${BOLD}$TARGET_BRANCH${RESET}…"
+info "Checking out ${B_GREEN}${TARGET_BRANCH}${RESET}…"
 git checkout "$TARGET_BRANCH" 2>/dev/null || die "Could not checkout $TARGET_BRANCH"
 git reset --hard "$REMOTE/$TARGET_BRANCH" >/dev/null 2>&1
 
-# ─── Build commit message ───────────────────────────────────────────────────
+# ─── Build merge commit message ──────────────────────────────────────────────
 
-MERGE_MSG="$(printf '%s (#%s)' "$PR_TITLE" "$PR_NUMBER")"
+# Strip any existing conventional-commit prefix from PR title
+stripped_title="$PR_TITLE"
+if [[ "$PR_TITLE" =~ ^[a-z]+(\([a-z0-9/_-]+\))?:[[:space:]]+(.*)$ ]]; then
+    stripped_title="${BASH_REMATCH[2]}"
+fi
+
+if [[ -n "$SELECTED_TYPE" ]]; then
+    MERGE_MSG="$(printf '%s: %s (#%s)' "$SELECTED_TYPE" "$stripped_title" "$PR_NUMBER")"
+else
+    MERGE_MSG="$(printf '%s (#%s)' "$PR_TITLE" "$PR_NUMBER")"
+fi
 
 # ─── Merge ───────────────────────────────────────────────────────────────────
 
+section "Merging"
+
 if [[ "$SQUASH" == true ]]; then
     info "Squash-merging PR #${PR_NUMBER}…"
-    git merge --squash "pr-$PR_NUMBER" >/dev/null 2>&1 \
+    git merge --squash "pr-${PR_NUMBER}" >/dev/null 2>&1 \
         || die "Merge failed. Resolve conflicts and run: git commit"
 
     if [[ "$NO_COMMIT" == true ]]; then
-        ok "Squash-merged (no commit). Review with: git diff --cached"
+        ok "Squash-merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
     else
         git commit -m "$MERGE_MSG" >/dev/null 2>&1
-        ok "Squash-merged and committed: ${BOLD}$MERGE_MSG${RESET}"
+        ok "Squash-merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
     fi
 else
     info "Merge-committing PR #${PR_NUMBER}…"
 
     if [[ "$NO_COMMIT" == true ]]; then
-        git merge --no-ff --no-commit "pr-$PR_NUMBER" >/dev/null 2>&1 \
+        git merge --no-ff --no-commit "pr-${PR_NUMBER}" >/dev/null 2>&1 \
             || die "Merge failed. Resolve conflicts and run: git commit"
-        ok "Merged (no commit). Review with: git diff --cached"
+        ok "Merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
     else
-        git merge --no-ff -m "$MERGE_MSG" "pr-$PR_NUMBER" >/dev/null 2>&1 \
+        git merge --no-ff -m "$MERGE_MSG" "pr-${PR_NUMBER}" >/dev/null 2>&1 \
             || die "Merge failed. Resolve conflicts, then: git commit"
-        ok "Merged and committed: ${BOLD}$MERGE_MSG${RESET}"
+        ok "Merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
     fi
 fi
 
-# ─── Clean up temp branch ───────────────────────────────────────────────────
+git branch -D "pr-${PR_NUMBER}" >/dev/null 2>&1 || true
 
-git branch -D "pr-$PR_NUMBER" >/dev/null 2>&1 || true
+# ─── Version bump ────────────────────────────────────────────────────────────
 
-# ─── Post-merge ─────────────────────────────────────────────────────────────
+if [[ "$NO_COMMIT" == false ]]; then
+    manage_version_bump
+fi
 
+# ─── Summary ─────────────────────────────────────────────────────────────────
+
+section "Done"
+echo -e "${B_GREEN}✔${RESET} PR #${PR_NUMBER} merged into ${BOLD}${B_GREEN}$TARGET_BRANCH${RESET}"
 echo ""
-info "Next steps:"
-echo -e "  ${BOLD}git log --oneline -5${RESET}        Review commits"
-echo -e "  ${BOLD}git push $REMOTE $TARGET_BRANCH${RESET}  Push to remote"
+echo -e "${DIM}Next steps:${RESET}"
+echo -e "  ${BOLD}git log --oneline -5${RESET}              ${DIM}Review commits${RESET}"
+echo -e "  ${BOLD}git push $REMOTE $TARGET_BRANCH --follow-tags${RESET}  ${DIM}Push (with tags)${RESET}"
 echo ""
+
+# ─── Thank the author ────────────────────────────────────────────────────────
 
 if [[ "$NO_THANKS" == false ]]; then
-    if ask_yes_no "Thank @$PR_AUTHOR on the PR?" "y"; then
+    if ask_yes_no "Thank ${BRIGHT_CYAN}@${PR_AUTHOR}${RESET} on the PR?" "y"; then
         gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
             -f body="Thank you @$PR_AUTHOR!" >/dev/null 2>&1 \
-            && ok "Posted a thank-you comment on PR #$PR_NUMBER" \
+            && ok "Posted a thank-you comment on PR #${PR_NUMBER}" \
             || warn "Could not post comment (check your token permissions)"
     fi
 fi
 
 echo ""
-ok "Done! PR #$PR_NUMBER merged into ${BOLD}$TARGET_BRANCH${RESET}."
