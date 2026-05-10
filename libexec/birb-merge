@@ -79,26 +79,59 @@ ask_yes_no() {
     [[ "$yn" =~ ^[Yy] ]]
 }
 
+# Run a command, or print it in dry-run mode. Use for any state-mutating
+# operation (git commit/tag/push, gh edit/close/comment, file writes).
+# Writes the dry-run line to /dev/tty when available, so callers that pipe
+# stdout/stderr to /dev/null still see what would have run.
+run() {
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        local arg parts=()
+        for arg in "$@"; do
+            if [[ -z "$arg" || "$arg" =~ [[:space:]\"\'\$\\] ]]; then
+                arg="${arg//\'/\'\\\'\'}"
+                parts+=("'$arg'")
+            else
+                parts+=("$arg")
+            fi
+        done
+        local msg="  ${DIM}[dry-run]${RESET} ${parts[*]}"
+        # Try /dev/tty so the line survives caller >/dev/null redirections;
+        # fall back to stdout if the controlling terminal isn't available.
+        echo -e "$msg" > /dev/tty 2>/dev/null || echo -e "$msg"
+        return 0
+    fi
+    "$@"
+}
+
 # ─── Usage ───────────────────────────────────────────────────────────────────
 
 usage() {
     cat <<EOF
-$(echo -e "${BOLD}${B_MAGENTA}birb merge${RESET}") — Merge GitHub pull requests locally.
+$(echo -e "${BOLD}${B_MAGENTA}birb merge${RESET}") — Merge GitHub pull requests locally, then wrap up remotely
+(push, close PR, close linked issue, move project item to Done).
 
 $(echo -e "${BOLD}Usage:${RESET}")
   birb merge <PR_NUMBER> [OPTIONS]
 
 $(echo -e "${BOLD}Options:${RESET}")
   -s, --switch <branch>   Merge into a different branch than the PR's base
-  --no-commit             Merge but don't commit (inspect/tweak first)
-  --no-thanks             Skip the "thank the author" suggestion
+  --no-commit             Merge but don't commit (inspect/tweak first; skips
+                          all remote steps)
+  --no-thanks             Skip the "thank the author" comment
   --force-squash          Force squash even with multiple authors
+  --no-push               Skip pushing the target branch + new tag
+  --no-close-pr           Skip closing the PR on GitHub
+  --no-close-issue        Skip closing any issue linked in the PR body
+  --no-project-update     Skip moving the linked project item to "Done"
+  --dry-run               Print every mutating command without running it
   -h, --help              Show this help
 
 $(echo -e "${BOLD}Examples:${RESET}")
   birb merge 42
   birb merge 42 --switch=main
   birb merge 42 --no-commit
+  birb merge 42 --dry-run
+  birb merge 42 --no-project-update --no-close-issue
 EOF
     exit 0
 }
@@ -116,13 +149,17 @@ get_remote() {
 
 get_repo_slug() {
     local remote="$1"
-    local url
+    local url owner name
     url="$(git remote get-url "$remote" 2>/dev/null)" || die "Remote '$remote' not found"
 
-    if [[ "$url" =~ git@github\.com:([^/]+)/([^/.]+) ]]; then
-        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-    elif [[ "$url" =~ github\.com/([^/]+)/([^/.]+) ]]; then
-        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    if [[ "$url" =~ git@github\.com:([^/]+)/(.+)$ ]]; then
+        owner="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]%.git}"
+        echo "$owner/$name"
+    elif [[ "$url" =~ github\.com/([^/]+)/(.+)$ ]]; then
+        owner="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]%.git}"
+        echo "$owner/$name"
     else
         die "Cannot parse GitHub repo from remote URL: $url"
     fi
@@ -238,13 +275,17 @@ manage_labels() {
             if [[ "$idx" -ge 0 && "$idx" -lt "${#labels_arr[@]}" ]]; then
                 label="${labels_arr[$idx]}"
                 if echo "$current_labels" | grep -qx "$label" 2>/dev/null; then
-                    gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$label" >/dev/null 2>&1 \
-                        && info "Removed: ${RED}$label${RESET}" \
-                        || warn "Failed to remove: $label"
+                    if run gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$label" >/dev/null 2>&1; then
+                        info "Removed: ${RED}$label${RESET}"
+                    else
+                        warn "Failed to remove: $label"
+                    fi
                 else
-                    gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$label" >/dev/null 2>&1 \
-                        && info "Added: ${GREEN}$label${RESET}" \
-                        || warn "Failed to add: $label"
+                    if run gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$label" >/dev/null 2>&1; then
+                        info "Added: ${GREEN}$label${RESET}"
+                    else
+                        warn "Failed to add: $label"
+                    fi
                 fi
             fi
         fi
@@ -292,6 +333,14 @@ bump_semver() {
 
 apply_version_bump() {
     local new="$1" kind="$2"
+    if [[ "$DRY_RUN" == true ]]; then
+        case "$kind" in
+            npm)          run sh -c "jq --arg v '$new' '.version = \$v' package.json > package.json && git add package.json" ;;
+            composer)     run sh -c "jq --arg v '$new' '.version = \$v' composer.json > composer.json && git add composer.json" ;;
+            version-file) run sh -c "echo '$new' > VERSION && git add VERSION" ;;
+        esac
+        return
+    fi
     case "$kind" in
         npm)
             local tmp
@@ -367,15 +416,386 @@ manage_version_bump() {
 
     if [[ "$kind" != "git-tag" ]]; then
         apply_version_bump "$new_version" "$kind"
-        git commit -m "chore: bump version to $new_version" >/dev/null
-        ok "Bumped ${kind} to ${BOLD}${B_MAGENTA}$new_version${RESET}"
+        if run git commit -m "chore: bump version to $new_version" >/dev/null; then
+            ok "Bumped ${kind} to ${BOLD}${B_MAGENTA}$new_version${RESET}"
+        else
+            warn "Version bump commit failed"
+        fi
     fi
 
     if ask_yes_no "Create git tag v${new_version}?" "y"; then
-        git tag "v${new_version}" \
-            && ok "Tagged ${BOLD}${B_MAGENTA}v${new_version}${RESET}" \
-            || warn "Could not create tag (already exists?)"
+        if run git tag "v${new_version}" 2>/dev/null; then
+            NEW_TAG="v${new_version}"
+            ok "Tagged ${BOLD}${B_MAGENTA}v${new_version}${RESET}"
+        elif [[ "$DRY_RUN" != true ]] && git rev-parse "v${new_version}" >/dev/null 2>&1; then
+            # Tag already exists locally — re-runs (e.g. after a failed push)
+            # should still push the existing tag rather than silently dropping it.
+            NEW_TAG="v${new_version}"
+            info "Tag ${BOLD}${B_MAGENTA}v${new_version}${RESET} already exists — will push existing tag"
+        else
+            warn "Could not create tag v${new_version}"
+        fi
     fi
+}
+
+# ─── Linked-issue extraction ─────────────────────────────────────────────────
+
+# Greps PR body for GitHub closing keywords + #N and prints unique issue
+# numbers, one per line. Returns nothing if the PR has no body or matches.
+extract_linked_issues() {
+    local body
+    body="$(echo "$PR_JSON" | jq -r '.body // ""')"
+    [[ -z "$body" ]] && return 0
+    echo "$body" \
+        | grep -oiE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+        | grep -oE '[0-9]+$' \
+        | awk '!seen[$0]++'
+}
+
+# ─── Push step ───────────────────────────────────────────────────────────────
+
+# Pushes the target branch and the new tag (if any). Tags created by this
+# script are lightweight, so --follow-tags would skip them — we push the new
+# tag explicitly. Critical: aborts on failure since every step after this one
+# depends on the commit + tag being on origin.
+push_changes() {
+    section "Pushing to ${REMOTE}"
+
+    if [[ "$NO_COMMIT" == true ]]; then
+        info "Skipped — --no-commit means there is no merge commit to push."
+        return
+    fi
+
+    if [[ "$NO_PUSH" == true ]]; then
+        info "Skipped (--no-push). Remote steps still run against the local merge SHA."
+        return
+    fi
+
+    info "Pushing ${BOLD}$TARGET_BRANCH${RESET}…"
+    if run git push "$REMOTE" "$TARGET_BRANCH"; then
+        ok "Pushed ${BOLD}$TARGET_BRANCH${RESET} → ${BRIGHT_CYAN}$REPO${RESET}"
+        PUSHED_BRANCH=true
+    else
+        die "Failed to push $TARGET_BRANCH to $REMOTE. Resolve and re-run, or pass --no-push."
+    fi
+
+    if [[ -n "$NEW_TAG" ]]; then
+        info "Pushing tag ${BOLD}$NEW_TAG${RESET}…"
+        if run git push "$REMOTE" "$NEW_TAG"; then
+            ok "Pushed tag ${BOLD}${B_MAGENTA}$NEW_TAG${RESET}"
+            PUSHED_TAG="$NEW_TAG"
+        else
+            warn "Failed to push tag $NEW_TAG (continuing — push manually with: git push $REMOTE $NEW_TAG)"
+        fi
+    fi
+}
+
+# ─── Close PR ────────────────────────────────────────────────────────────────
+
+# Closes the PR with a comment referencing the merge SHA (and tag if any).
+# Idempotent: checks state first; if already MERGED (e.g. non-squash merge
+# auto-closed by GitHub after push) or CLOSED, skips. Non-critical: warns on
+# failure since the merge has already landed on origin.
+close_pr() {
+    section "Closing PR #${PR_NUMBER}"
+
+    if [[ "$NO_COMMIT" == true ]]; then
+        info "Skipped — --no-commit leaves the PR untouched."
+        PR_CLOSE_STATUS="skipped"
+        return
+    fi
+
+    if [[ "$NO_CLOSE_PR" == true ]]; then
+        info "Skipped (--no-close-pr)."
+        PR_CLOSE_STATUS="skipped"
+        return
+    fi
+
+    local state
+    state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq .state 2>/dev/null || echo "")"
+
+    case "$state" in
+        MERGED)
+            info "PR #${PR_NUMBER} already shows as merged on GitHub (auto-closed by push)."
+            PR_CLOSE_STATUS="auto-merged"
+            return
+            ;;
+        CLOSED)
+            info "PR #${PR_NUMBER} already closed."
+            PR_CLOSE_STATUS="already-closed"
+            return
+            ;;
+    esac
+
+    local verb="Squash-merged"
+    [[ "$SQUASH" != true ]] && verb="Merged"
+    local comment="${verb} into \`${TARGET_BRANCH}\` as ${SQUASH_SHA}"
+    [[ -n "$NEW_TAG" ]] && comment="${comment} (${NEW_TAG})"
+    comment="${comment}."
+
+    # Only delete the head branch when the PR head is in the same repo
+    # (gh would error out trying to delete a fork's branch).
+    local same_repo
+    same_repo="$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "") == (.base.repo.full_name // "")')"
+
+    info "Closing PR #${PR_NUMBER}…"
+    local close_args=("pr" "close" "$PR_NUMBER" "--repo" "$REPO" "--comment" "$comment")
+    [[ "$same_repo" == "true" ]] && close_args+=("--delete-branch")
+
+    if run gh "${close_args[@]}"; then
+        ok "Closed PR #${PR_NUMBER}"
+        PR_CLOSE_STATUS="closed"
+    else
+        warn "Failed to close PR #${PR_NUMBER} (the merge has already been pushed; close it manually)"
+        PR_CLOSE_STATUS="failed"
+    fi
+}
+
+# ─── Close linked issues ─────────────────────────────────────────────────────
+
+# Closes every issue referenced via a closing keyword in the PR body
+# (close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved + #N).
+# Idempotent per-issue: checks state first. Non-critical: warns and continues
+# on per-issue failure.
+close_linked_issues() {
+    section "Closing linked issues"
+
+    if [[ "$NO_CLOSE_ISSUE" == true ]]; then
+        info "Skipped (--no-close-issue)."
+        return
+    fi
+
+    local issues
+    issues="$(extract_linked_issues)"
+
+    if [[ -z "$issues" ]]; then
+        info "No linked issue keyword found in PR body. Skipping."
+        return
+    fi
+
+    local issue_num state comment
+    while IFS= read -r issue_num; do
+        [[ -z "$issue_num" ]] && continue
+
+        state="$(gh issue view "$issue_num" --repo "$REPO" --json state --jq .state 2>/dev/null || echo "")"
+        if [[ -z "$state" ]]; then
+            warn "Issue #${issue_num} not found in $REPO — skipping"
+            SKIPPED_ISSUES+=("$issue_num")
+            continue
+        fi
+        if [[ "$state" == "CLOSED" ]]; then
+            info "Issue #${issue_num} already closed."
+            SKIPPED_ISSUES+=("$issue_num")
+            continue
+        fi
+
+        comment="Done in ${SQUASH_SHA}"
+        [[ -n "$NEW_TAG" ]] && comment="${comment} (${NEW_TAG})"
+        comment="${comment}. PR #${PR_NUMBER} merged."
+
+        info "Closing issue #${issue_num}…"
+        if run gh issue close "$issue_num" --repo "$REPO" --reason completed --comment "$comment"; then
+            ok "Closed issue #${issue_num}"
+            CLOSED_ISSUES+=("$issue_num")
+        else
+            warn "Could not close issue #${issue_num} (continuing)"
+            FAILED_ISSUES+=("$issue_num")
+        fi
+    done <<< "$issues"
+}
+
+# ─── Project board update ────────────────────────────────────────────────────
+
+# Discovers projects owned by the repo owner, finds project items linked to
+# the PR or any linked issue, and moves them to the Status field's "Done"
+# option. Field id and option id are discovered at runtime by name match
+# (case-insensitive). Non-critical: warns and continues on any failure.
+# Requires the gh `project` scope; the user can grant it with:
+#   gh auth refresh -s project,read:project
+update_project_item() {
+    section "Updating project board"
+
+    if [[ "$NO_PROJECT_UPDATE" == true ]]; then
+        info "Skipped (--no-project-update)."
+        return
+    fi
+
+    local owner="${REPO%%/*}"
+
+    local projects
+    if ! projects="$(gh project list --owner "$owner" --format json 2>/dev/null)"; then
+        info "Could not list projects for $owner (missing 'project' scope?). Skipping."
+        info "  Grant it with: ${BOLD}gh auth refresh -s project,read:project${RESET}"
+        return
+    fi
+
+    local project_count
+    project_count="$(echo "$projects" | jq '.projects | length' 2>/dev/null || echo 0)"
+    if [[ "$project_count" == "0" || -z "$project_count" ]]; then
+        info "No projects found for $owner. Skipping."
+        return
+    fi
+
+    # Targets: the PR plus any linked issues.
+    local targets=("$PR_NUMBER")
+    local linked
+    linked="$(extract_linked_issues)"
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && targets+=("$n")
+    done <<< "$linked"
+
+    local moved_any=false
+    local project_data project_number project_id project_title
+    local items fields status_field_id done_option_id status_field_name done_option_name
+    local target matching_ids item_id
+
+    while IFS= read -r project_data; do
+        project_number="$(echo "$project_data" | jq -r '.number')"
+        project_id="$(echo "$project_data" | jq -r '.id')"
+        project_title="$(echo "$project_data" | jq -r '.title')"
+
+        if ! items="$(gh project item-list "$project_number" --owner "$owner" --format json --limit 200 2>/dev/null)"; then
+            continue
+        fi
+
+        # Discover Status field id + Done option id (case-insensitive).
+        if ! fields="$(gh project field-list "$project_number" --owner "$owner" --format json 2>/dev/null)"; then
+            continue
+        fi
+
+        status_field_id="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].id // empty')"
+        status_field_name="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].name // empty')"
+        if [[ -z "$status_field_id" ]]; then
+            continue
+        fi
+        done_option_id="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].options[]? | select((.name // "") | ascii_downcase == "done") | .id' | head -1)"
+        done_option_name="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].options[]? | select((.name // "") | ascii_downcase == "done") | .name' | head -1)"
+        if [[ -z "$done_option_id" ]]; then
+            continue
+        fi
+
+        for target in "${targets[@]}"; do
+            matching_ids="$(echo "$items" | jq -r --argjson n "$target" '.items[]? | select((.content.number // 0) == $n) | .id' 2>/dev/null)"
+            [[ -z "$matching_ids" ]] && continue
+
+            while IFS= read -r item_id; do
+                [[ -z "$item_id" ]] && continue
+                info "Moving item linked to ${B_MAGENTA}#${target}${RESET} in ${BOLD}${project_title}${RESET} → ${B_GREEN}${done_option_name}${RESET}…"
+                if run gh project item-edit \
+                        --id "$item_id" \
+                        --field-id "$status_field_id" \
+                        --project-id "$project_id" \
+                        --single-select-option-id "$done_option_id" >/dev/null; then
+                    ok "Moved ${project_title}/#${target} to ${B_GREEN}${done_option_name}${RESET}"
+                    PROJECT_ITEMS_MOVED+=("${project_title} → ${done_option_name} (#${target})")
+                    moved_any=true
+                else
+                    warn "Could not update project item for #${target} in ${project_title} (continuing)"
+                    PROJECT_ITEMS_FAILED+=("${project_title} (#${target})")
+                fi
+            done <<< "$matching_ids"
+        done
+    done <<< "$(echo "$projects" | jq -c '.projects[]?')"
+
+    if [[ "$moved_any" != true && ${#PROJECT_ITEMS_FAILED[@]} -eq 0 ]]; then
+        info "No matching project items found for PR #${PR_NUMBER} or its linked issues."
+    fi
+}
+
+# ─── Thank author ────────────────────────────────────────────────────────────
+
+thank_author() {
+    if [[ "$NO_THANKS" == true ]]; then
+        THANK_STATUS="skipped"
+        return
+    fi
+
+    echo ""
+    if ! ask_yes_no "Thank ${BRIGHT_CYAN}@${PR_AUTHOR}${RESET} on the PR?" "y"; then
+        THANK_STATUS="skipped"
+        return
+    fi
+
+    if run gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="Thank you @$PR_AUTHOR!" >/dev/null; then
+        ok "Posted a thank-you comment on PR #${PR_NUMBER}"
+        THANK_STATUS="posted"
+    else
+        warn "Could not post comment (check your token permissions)"
+        THANK_STATUS="failed"
+    fi
+}
+
+# ─── Final summary ───────────────────────────────────────────────────────────
+
+print_summary() {
+    section "Summary"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${BOLD}${B_YELLOW}DRY RUN${RESET} — no state was changed."
+        echo ""
+    fi
+
+    echo -e "  ${DIM}Merge commit:${RESET}     ${BOLD}${SQUASH_SHA:-—}${RESET}"
+    echo -e "  ${DIM}Tag:${RESET}              ${BOLD}${NEW_TAG:-—}${RESET}"
+
+    local push_str="${B_YELLOW}skipped${RESET}"
+    if [[ "$PUSHED_BRANCH" == true ]]; then
+        push_str="${B_GREEN}✔${RESET} ${TARGET_BRANCH}"
+        [[ -n "$PUSHED_TAG" ]] && push_str="${push_str} + ${PUSHED_TAG}"
+    fi
+    echo -e "  ${DIM}Pushed:${RESET}           $push_str"
+
+    local pr_str
+    case "$PR_CLOSE_STATUS" in
+        closed)         pr_str="${B_GREEN}✔${RESET} closed (#${PR_NUMBER})" ;;
+        already-closed) pr_str="${DIM}already closed${RESET}" ;;
+        auto-merged)    pr_str="${B_GREEN}✔${RESET} auto-closed by push" ;;
+        skipped)        pr_str="${B_YELLOW}skipped${RESET}" ;;
+        failed)         pr_str="${B_RED}failed${RESET} (close manually)" ;;
+        *)              pr_str="${DIM}—${RESET}" ;;
+    esac
+    echo -e "  ${DIM}PR:${RESET}               $pr_str"
+
+    local issues_str=""
+    if [[ ${#CLOSED_ISSUES[@]} -gt 0 ]]; then
+        issues_str="${B_GREEN}✔${RESET} #$(IFS=,; echo "${CLOSED_ISSUES[*]}")"
+    fi
+    if [[ ${#SKIPPED_ISSUES[@]} -gt 0 ]]; then
+        [[ -n "$issues_str" ]] && issues_str="$issues_str  "
+        issues_str="${issues_str}${DIM}skipped: #$(IFS=,; echo "${SKIPPED_ISSUES[*]}")${RESET}"
+    fi
+    if [[ ${#FAILED_ISSUES[@]} -gt 0 ]]; then
+        [[ -n "$issues_str" ]] && issues_str="$issues_str  "
+        issues_str="${issues_str}${B_RED}failed: #$(IFS=,; echo "${FAILED_ISSUES[*]}")${RESET}"
+    fi
+    [[ -z "$issues_str" ]] && issues_str="${DIM}—${RESET}"
+    echo -e "  ${DIM}Issues:${RESET}           $issues_str"
+
+    local proj_str=""
+    if [[ ${#PROJECT_ITEMS_MOVED[@]} -gt 0 ]]; then
+        local m
+        for m in "${PROJECT_ITEMS_MOVED[@]}"; do
+            proj_str="${proj_str:+${proj_str}; }${B_GREEN}✔${RESET} $m"
+        done
+    fi
+    if [[ ${#PROJECT_ITEMS_FAILED[@]} -gt 0 ]]; then
+        local f
+        for f in "${PROJECT_ITEMS_FAILED[@]}"; do
+            proj_str="${proj_str:+${proj_str}; }${B_RED}failed${RESET} $f"
+        done
+    fi
+    [[ -z "$proj_str" ]] && proj_str="${DIM}—${RESET}"
+    echo -e "  ${DIM}Project board:${RESET}    $proj_str"
+
+    local thank_str
+    case "$THANK_STATUS" in
+        posted)  thank_str="${B_GREEN}✔${RESET} posted" ;;
+        skipped) thank_str="${B_YELLOW}skipped${RESET}" ;;
+        failed)  thank_str="${B_RED}failed${RESET}" ;;
+        *)       thank_str="${DIM}—${RESET}" ;;
+    esac
+    echo -e "  ${DIM}Thank-you:${RESET}        $thank_str"
+    echo ""
 }
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
@@ -385,7 +805,25 @@ SWITCH_BRANCH=""
 NO_COMMIT=false
 NO_THANKS=false
 FORCE_SQUASH=false
+NO_PUSH=false
+NO_CLOSE_PR=false
+NO_CLOSE_ISSUE=false
+NO_PROJECT_UPDATE=false
+DRY_RUN=false
 SELECTED_TYPE=""
+
+# Tracking state for the final summary.
+SQUASH_SHA=""
+NEW_TAG=""
+PUSHED_BRANCH=false
+PUSHED_TAG=""
+PR_CLOSE_STATUS=""        # one of: closed, already-closed, auto-merged, skipped, failed, dry-run
+THANK_STATUS=""           # one of: posted, skipped, failed, dry-run
+CLOSED_ISSUES=()
+SKIPPED_ISSUES=()
+FAILED_ISSUES=()
+PROJECT_ITEMS_MOVED=()
+PROJECT_ITEMS_FAILED=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -400,6 +838,16 @@ while [[ $# -gt 0 ]]; do
             NO_THANKS=true; shift ;;
         --force-squash)
             FORCE_SQUASH=true; shift ;;
+        --no-push)
+            NO_PUSH=true; shift ;;
+        --no-close-pr)
+            NO_CLOSE_PR=true; shift ;;
+        --no-close-issue)
+            NO_CLOSE_ISSUE=true; shift ;;
+        --no-project-update)
+            NO_PROJECT_UPDATE=true; shift ;;
+        --dry-run)
+            DRY_RUN=true; shift ;;
         -*)
             die "Unknown option: $1" ;;
         *)
@@ -521,26 +969,51 @@ section "Merging"
 
 if [[ "$SQUASH" == true ]]; then
     info "Squash-merging PR #${PR_NUMBER}…"
-    git merge --squash "pr-${PR_NUMBER}" >/dev/null 2>&1 \
-        || die "Merge failed. Resolve conflicts and run: git commit"
+    if [[ "$DRY_RUN" == true ]]; then
+        run git merge --squash "pr-${PR_NUMBER}"
+    else
+        git merge --squash "pr-${PR_NUMBER}" >/dev/null 2>&1 \
+            || die "Merge failed. Resolve conflicts and run: git commit"
+    fi
 
     if [[ "$NO_COMMIT" == true ]]; then
         ok "Squash-merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
     else
-        git commit -m "$MERGE_MSG" >/dev/null 2>&1
-        ok "Squash-merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
+        if run git commit -m "$MERGE_MSG" >/dev/null 2>&1; then
+            ok "Squash-merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
+        else
+            [[ "$DRY_RUN" == true ]] || die "Squash commit failed"
+        fi
     fi
 else
     info "Merge-committing PR #${PR_NUMBER}…"
 
     if [[ "$NO_COMMIT" == true ]]; then
-        git merge --no-ff --no-commit "pr-${PR_NUMBER}" >/dev/null 2>&1 \
-            || die "Merge failed. Resolve conflicts and run: git commit"
+        if [[ "$DRY_RUN" == true ]]; then
+            run git merge --no-ff --no-commit "pr-${PR_NUMBER}"
+        else
+            git merge --no-ff --no-commit "pr-${PR_NUMBER}" >/dev/null 2>&1 \
+                || die "Merge failed. Resolve conflicts and run: git commit"
+        fi
         ok "Merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
     else
-        git merge --no-ff -m "$MERGE_MSG" "pr-${PR_NUMBER}" >/dev/null 2>&1 \
-            || die "Merge failed. Resolve conflicts, then: git commit"
+        if [[ "$DRY_RUN" == true ]]; then
+            run git merge --no-ff -m "$MERGE_MSG" "pr-${PR_NUMBER}"
+        else
+            git merge --no-ff -m "$MERGE_MSG" "pr-${PR_NUMBER}" >/dev/null 2>&1 \
+                || die "Merge failed. Resolve conflicts, then: git commit"
+        fi
         ok "Merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
+    fi
+fi
+
+# Capture the merge commit SHA before any subsequent commits (version bump),
+# so PR / issue close comments can reference exactly the merged commit.
+if [[ "$NO_COMMIT" == false ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+        SQUASH_SHA="<dry-run-sha>"
+    else
+        SQUASH_SHA="$(git rev-parse --short=12 HEAD)"
     fi
 fi
 
@@ -552,25 +1025,19 @@ if [[ "$NO_COMMIT" == false ]]; then
     manage_version_bump
 fi
 
-# ─── Summary ─────────────────────────────────────────────────────────────────
+# ─── Remote wrap-up ──────────────────────────────────────────────────────────
 
-section "Done"
-echo -e "${B_GREEN}✔${RESET} PR #${PR_NUMBER} merged into ${BOLD}${B_GREEN}$TARGET_BRANCH${RESET}"
-echo ""
-echo -e "${DIM}Next steps:${RESET}"
-echo -e "  ${BOLD}git log --oneline -5${RESET}              ${DIM}Review commits${RESET}"
-echo -e "  ${BOLD}git push $REMOTE $TARGET_BRANCH --follow-tags${RESET}  ${DIM}Push (with tags)${RESET}"
-echo ""
-
-# ─── Thank the author ────────────────────────────────────────────────────────
-
-if [[ "$NO_THANKS" == false ]]; then
-    if ask_yes_no "Thank ${BRIGHT_CYAN}@${PR_AUTHOR}${RESET} on the PR?" "y"; then
-        gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-            -f body="Thank you @$PR_AUTHOR!" >/dev/null 2>&1 \
-            && ok "Posted a thank-you comment on PR #${PR_NUMBER}" \
-            || warn "Could not post comment (check your token permissions)"
-    fi
+if [[ "$NO_COMMIT" == true ]]; then
+    section "Local merge complete"
+    info "Skipping push / close / project steps because of --no-commit."
+    info "Review with ${BOLD}git diff --cached${RESET}, finish the commit, then push manually."
+    echo ""
+else
+    push_changes
+    close_pr
+    close_linked_issues
+    update_project_item
+    thank_author
 fi
 
-echo ""
+print_summary
