@@ -1064,9 +1064,11 @@ echo -e "  ${DIM}Commits:${RESET} ${BOLD}$COMMIT_COUNT${RESET} by ${BOLD}$AUTHOR
 
 # ─── Ensure working tree is clean ────────────────────────────────────────────
 
-if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+# Only check tracked changes — untracked files survive checkout/reset/pull
+# and don't block the merge, so there's no reason to bounce on them.
+if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
     echo ""
-    die "Working tree is dirty. Please commit or stash your changes first."
+    die "Working tree has uncommitted tracked changes. Please commit or stash first."
 fi
 
 # ─── Interactive prompts ─────────────────────────────────────────────────────
