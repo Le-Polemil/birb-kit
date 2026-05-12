@@ -107,22 +107,30 @@ run() {
 
 usage() {
     cat <<EOF
-$(echo -e "${BOLD}${B_MAGENTA}birb merge${RESET}") — Merge GitHub pull requests locally, then wrap up remotely
-(push, close PR, close linked issue, move project item to Done).
+$(echo -e "${BOLD}${B_MAGENTA}birb merge${RESET}") — Merge a GitHub PR via gh pr merge, then run the local
+wrap-up (pull, version bump + tag, post-merge push, update project board,
+thank author).
+
+The merge itself runs on GitHub's side so the PR ends up flagged as
+MERGED (not just closed), referenced issues auto-close, and any stacked
+PR is auto-rebased onto the merged base rather than getting orphaned.
 
 $(echo -e "${BOLD}Usage:${RESET}")
   birb merge <PR_NUMBER> [OPTIONS]
 
 $(echo -e "${BOLD}Options:${RESET}")
-  -s, --switch <branch>   Merge into a different branch than the PR's base
-  --no-commit             Merge but don't commit (inspect/tweak first; skips
-                          all remote steps)
+  -s, --switch <branch>   Re-base the PR onto a different branch on GitHub
+                          before merging
+  --no-commit             Skip the GitHub merge — perform a local
+                          'git merge --no-commit' for inspection only
   --no-thanks             Skip the "thank the author" comment
-  --force-squash          Force squash even with multiple authors
-  --no-push               Skip pushing the target branch + new tag
-  --no-close-pr           Skip closing the PR on GitHub
-  --no-close-issue        Skip closing any issue linked in the PR body
-  --no-project-update     Skip moving the linked project item to "Done"
+  --force-squash          Use --squash even with multiple authors
+  --no-push               Skip pushing the post-merge version-bump commit
+                          and any new tag
+  --no-close-pr           Skip the post-merge PR confirmation step
+  --no-close-issue        Skip the explicit issue-close pass (GitHub
+                          auto-closes "closes #N" issues on merge anyway)
+  --no-project-update     Skip moving project items to "Done"
   --dry-run               Print every mutating command without running it
   -h, --help              Show this help
 
@@ -239,7 +247,10 @@ manage_labels() {
     fi
     echo ""
 
-    ask_yes_no "Modify labels before merge?" "n" || return
+    # NB: explicit `return 0` — under `set -e`, a bare `return` propagates
+    # ask_yes_no's non-zero status and aborts the whole script when the user
+    # declines the prompt.
+    ask_yes_no "Modify labels before merge?" "n" || return 0
 
     local available
     available="$(gh api "repos/$REPO/labels?per_page=100" --jq '.[].name' 2>/dev/null | sort)" \
@@ -452,35 +463,113 @@ extract_linked_issues() {
         | awk '!seen[$0]++'
 }
 
+# ─── GitHub-side merge ───────────────────────────────────────────────────────
+
+# Performs the merge via `gh pr merge`, i.e. on GitHub's own side. This is
+# the only way to:
+#   • Mark the PR as MERGED (not just CLOSED). A local squash + push leaves
+#     the squashed SHA unrelated to the PR head, so GitHub flags the PR as
+#     plainly closed.
+#   • Auto-rebase stacked PRs. When --delete-branch removes the head branch,
+#     GitHub re-targets any PR whose base was that branch onto its parent.
+#     Manual branch deletion (gh pr close --delete-branch) skips that step
+#     and instead auto-CLOSES the stacked PRs — the bug we're fixing.
+#   • Auto-close issues referenced via "closes #N" in the PR body.
+merge_on_github() {
+    section "Merging on GitHub"
+
+    # --switch: re-target the PR on GitHub before merging, so gh pr merge
+    # lands on the requested branch instead of the PR's original base.
+    if [[ -n "$SWITCH_BRANCH" && "$SWITCH_BRANCH" != "$PR_BASE_REF" ]]; then
+        info "Re-basing PR onto ${B_GREEN}${SWITCH_BRANCH}${RESET} (was ${YELLOW}${PR_BASE_REF}${RESET})…"
+        if ! run gh pr edit "$PR_NUMBER" --repo "$REPO" --base "$SWITCH_BRANCH" >/dev/null; then
+            die "Failed to change PR base to $SWITCH_BRANCH"
+        fi
+    fi
+
+    local merge_args=("pr" "merge" "$PR_NUMBER" "--repo" "$REPO" "--subject" "$MERGE_MSG")
+    if [[ "$SQUASH" == true ]]; then
+        # Empty --body keeps the squash commit clean (default is the
+        # concatenation of every PR commit message).
+        merge_args+=("--squash" "--body" "")
+    else
+        merge_args+=("--merge")
+    fi
+
+    # Only delete the branch when the PR head is in the same repo (gh would
+    # error trying to delete a fork's branch). Deleting the head branch is
+    # what triggers GitHub's auto-rebase of stacked PRs.
+    local same_repo
+    same_repo="$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "") == (.base.repo.full_name // "")')"
+    [[ "$same_repo" == "true" ]] && merge_args+=("--delete-branch")
+
+    info "Asking GitHub to ${SQUASH:+squash-}merge PR #${PR_NUMBER}…"
+    if ! run gh "${merge_args[@]}"; then
+        die "GitHub refused the merge. Check for conflicts, required reviews, or failing checks; then re-run."
+    fi
+
+    PR_CLOSE_STATUS="merged"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        SQUASH_SHA="<dry-run-sha>"
+        ok "Would merge PR #${PR_NUMBER} on GitHub and pull the result."
+        return 0
+    fi
+
+    # Pull the merge commit so the version bump (and tag) build on the right
+    # base. The merge commit is already on origin via gh pr merge.
+    info "Pulling merged ${B_GREEN}${TARGET_BRANCH}${RESET} from ${REMOTE}…"
+    git fetch "$REMOTE" "$TARGET_BRANCH" >/dev/null 2>&1 \
+        || die "Could not fetch ${TARGET_BRANCH} after merge"
+    git checkout "$TARGET_BRANCH" >/dev/null 2>&1 \
+        || die "Could not checkout ${TARGET_BRANCH}"
+    git reset --hard "$REMOTE/$TARGET_BRANCH" >/dev/null 2>&1
+    SQUASH_SHA="$(git rev-parse --short=12 HEAD)"
+    # The merge commit IS on origin (GitHub put it there). Reflect that in
+    # the summary so the operator doesn't think nothing was pushed.
+    PUSHED_BRANCH=true
+    ok "Merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
+    ok "Commit: ${BOLD}${SQUASH_SHA}${RESET}"
+}
+
 # ─── Push step ───────────────────────────────────────────────────────────────
 
-# Pushes the target branch and the new tag (if any). Tags created by this
-# script are lightweight, so --follow-tags would skip them — we push the new
-# tag explicitly. Critical: aborts on failure since every step after this one
-# depends on the commit + tag being on origin.
+# Pushes whatever local-only commits and tags the post-merge phase produced
+# (typically: a chore: bump-version commit on top of the merge commit, plus
+# a v* tag). The merge itself is already on origin via merge_on_github, so
+# we skip the branch push when HEAD is in sync.
 push_changes() {
-    section "Pushing to ${REMOTE}"
+    section "Pushing post-merge changes to ${REMOTE}"
 
     if [[ "$NO_COMMIT" == true ]]; then
         info "Skipped — --no-commit means there is no merge commit to push."
-        return
+        return 0
     fi
 
     if [[ "$NO_PUSH" == true ]]; then
-        info "Skipped (--no-push). Remote steps still run against the local merge SHA."
-        return
+        info "Skipped (--no-push). Version-bump commit and tag remain local."
+        return 0
     fi
 
-    info "Pushing ${BOLD}$TARGET_BRANCH${RESET}…"
-    if run git push "$REMOTE" "$TARGET_BRANCH"; then
-        ok "Pushed ${BOLD}$TARGET_BRANCH${RESET} → ${BRIGHT_CYAN}$REPO${RESET}"
-        PUSHED_BRANCH=true
+    local ahead=0
+    if [[ "$DRY_RUN" != true ]]; then
+        ahead="$(git rev-list --count "$REMOTE/$TARGET_BRANCH..HEAD" 2>/dev/null || echo 0)"
+    fi
+
+    if [[ "$ahead" -gt 0 ]]; then
+        info "Pushing ${BOLD}$TARGET_BRANCH${RESET} (${ahead} local commit(s) ahead)…"
+        if run git push "$REMOTE" "$TARGET_BRANCH"; then
+            ok "Pushed ${BOLD}$TARGET_BRANCH${RESET} → ${BRIGHT_CYAN}$REPO${RESET}"
+        else
+            die "Failed to push $TARGET_BRANCH to $REMOTE. Resolve and re-run, or pass --no-push."
+        fi
     else
-        die "Failed to push $TARGET_BRANCH to $REMOTE. Resolve and re-run, or pass --no-push."
+        info "Branch ${BOLD}$TARGET_BRANCH${RESET} already in sync with ${REMOTE}."
     fi
 
     if [[ -n "$NEW_TAG" ]]; then
         info "Pushing tag ${BOLD}$NEW_TAG${RESET}…"
+        # Lightweight tags don't ride along on --follow-tags, so push by name.
         if run git push "$REMOTE" "$NEW_TAG"; then
             ok "Pushed tag ${BOLD}${B_MAGENTA}$NEW_TAG${RESET}"
             PUSHED_TAG="$NEW_TAG"
@@ -490,25 +579,30 @@ push_changes() {
     fi
 }
 
-# ─── Close PR ────────────────────────────────────────────────────────────────
+# ─── Verify PR state & post follow-up comment ────────────────────────────────
 
-# Closes the PR with a comment referencing the merge SHA (and tag if any).
-# Idempotent: checks state first; if already MERGED (e.g. non-squash merge
-# auto-closed by GitHub after push) or CLOSED, skips. Non-critical: warns on
-# failure since the merge has already landed on origin.
+# After merge_on_github, GitHub has already marked the PR as MERGED and
+# auto-deleted the head branch. This step verifies state and (optionally)
+# adds a comment with the version tag — the merge SHA is already visible
+# on the PR via GitHub's own "Merged via commit X" notice.
 close_pr() {
-    section "Closing PR #${PR_NUMBER}"
+    section "Confirming PR #${PR_NUMBER}"
 
     if [[ "$NO_COMMIT" == true ]]; then
         info "Skipped — --no-commit leaves the PR untouched."
         PR_CLOSE_STATUS="skipped"
-        return
+        return 0
     fi
 
     if [[ "$NO_CLOSE_PR" == true ]]; then
         info "Skipped (--no-close-pr)."
         PR_CLOSE_STATUS="skipped"
-        return
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        info "Would verify PR #${PR_NUMBER} is MERGED."
+        return 0
     fi
 
     local state
@@ -516,38 +610,31 @@ close_pr() {
 
     case "$state" in
         MERGED)
-            info "PR #${PR_NUMBER} already shows as merged on GitHub (auto-closed by push)."
-            PR_CLOSE_STATUS="auto-merged"
-            return
+            ok "PR #${PR_NUMBER} confirmed ${B_GREEN}MERGED${RESET} on GitHub."
+            PR_CLOSE_STATUS="merged"
             ;;
         CLOSED)
-            info "PR #${PR_NUMBER} already closed."
-            PR_CLOSE_STATUS="already-closed"
-            return
+            warn "PR #${PR_NUMBER} shows as CLOSED (not MERGED). Inspect on GitHub."
+            PR_CLOSE_STATUS="closed-not-merged"
+            return 0
+            ;;
+        *)
+            warn "Unexpected PR state: ${state:-unknown}. Inspect on GitHub."
+            PR_CLOSE_STATUS="failed"
+            return 0
             ;;
     esac
 
-    local verb="Squash-merged"
-    [[ "$SQUASH" != true ]] && verb="Merged"
-    local comment="${verb} into \`${TARGET_BRANCH}\` as ${SQUASH_SHA}"
-    [[ -n "$NEW_TAG" ]] && comment="${comment} (${NEW_TAG})"
-    comment="${comment}."
-
-    # Only delete the head branch when the PR head is in the same repo
-    # (gh would error out trying to delete a fork's branch).
-    local same_repo
-    same_repo="$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "") == (.base.repo.full_name // "")')"
-
-    info "Closing PR #${PR_NUMBER}…"
-    local close_args=("pr" "close" "$PR_NUMBER" "--repo" "$REPO" "--comment" "$comment")
-    [[ "$same_repo" == "true" ]] && close_args+=("--delete-branch")
-
-    if run gh "${close_args[@]}"; then
-        ok "Closed PR #${PR_NUMBER}"
-        PR_CLOSE_STATUS="closed"
-    else
-        warn "Failed to close PR #${PR_NUMBER} (the merge has already been pushed; close it manually)"
-        PR_CLOSE_STATUS="failed"
+    # Add a tag-reference comment only when a new tag was created. The merge
+    # SHA itself is already shown by GitHub on the merged PR, so we skip
+    # commenting in the tag-less case to avoid noise.
+    if [[ -n "$NEW_TAG" ]]; then
+        info "Posting tag-reference comment on PR #${PR_NUMBER}…"
+        if run gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Released as ${NEW_TAG}." >/dev/null; then
+            ok "Comment posted."
+        else
+            warn "Could not post tag comment (continuing)."
+        fi
     fi
 }
 
@@ -617,7 +704,7 @@ update_project_item() {
 
     if [[ "$NO_PROJECT_UPDATE" == true ]]; then
         info "Skipped (--no-project-update)."
-        return
+        return 0
     fi
 
     local owner="${REPO%%/*}"
@@ -626,79 +713,142 @@ update_project_item() {
     if ! projects="$(gh project list --owner "$owner" --format json 2>/dev/null)"; then
         info "Could not list projects for $owner (missing 'project' scope?). Skipping."
         info "  Grant it with: ${BOLD}gh auth refresh -s project,read:project${RESET}"
-        return
+        return 0
     fi
 
     local project_count
     project_count="$(echo "$projects" | jq '.projects | length' 2>/dev/null || echo 0)"
     if [[ "$project_count" == "0" || -z "$project_count" ]]; then
         info "No projects found for $owner. Skipping."
-        return
+        return 0
     fi
 
-    # Targets: the PR plus any linked issues.
-    local targets=("$PR_NUMBER")
-    local linked
+    # Build target number set: the PR plus any linked issues from the PR body.
+    # These are the auto-matched candidates that get preselected (green dot).
+    local -a targets=("$PR_NUMBER")
+    local linked n
     linked="$(extract_linked_issues)"
     while IFS= read -r n; do
         [[ -n "$n" ]] && targets+=("$n")
     done <<< "$linked"
 
-    local moved_any=false
+    # JSON array literal for the jq filter. Safe to inline — every entry has
+    # already been validated as an integer (PR_NUMBER) or matched by digit
+    # regex (extract_linked_issues).
+    local targets_json
+    targets_json="$(IFS=,; echo "[${targets[*]}]")"
+
+    # Parallel arrays of candidate items. Each index is one item to (maybe)
+    # move; CAND_SELECTED carries its toggle state.
+    local -a CAND_PROJ_TITLE=() CAND_PROJ_ID=()
+    local -a CAND_FIELD_ID=() CAND_OPTION_ID=() CAND_OPTION_NAME=()
+    local -a CAND_ITEM_ID=() CAND_ITEM_URL=() CAND_ITEM_NUMBER=() CAND_ITEM_TITLE=()
+    local -a CAND_SELECTED=()
+
     local project_data project_number project_id project_title
-    local items fields status_field_id done_option_id status_field_name done_option_name
-    local target matching_ids item_id
+    local items fields status_field_id done_option_id done_option_name
+    local match_line item_id item_url item_number item_title
 
     while IFS= read -r project_data; do
         project_number="$(echo "$project_data" | jq -r '.number')"
         project_id="$(echo "$project_data" | jq -r '.id')"
         project_title="$(echo "$project_data" | jq -r '.title')"
 
-        if ! items="$(gh project item-list "$project_number" --owner "$owner" --format json --limit 200 2>/dev/null)"; then
-            continue
-        fi
-
-        # Discover Status field id + Done option id (case-insensitive).
-        if ! fields="$(gh project field-list "$project_number" --owner "$owner" --format json 2>/dev/null)"; then
-            continue
-        fi
+        items="$(gh project item-list "$project_number" --owner "$owner" --format json --limit 200 2>/dev/null)" || continue
+        fields="$(gh project field-list "$project_number" --owner "$owner" --format json 2>/dev/null)" || continue
 
         status_field_id="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].id // empty')"
-        status_field_name="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].name // empty')"
-        if [[ -z "$status_field_id" ]]; then
-            continue
-        fi
+        [[ -z "$status_field_id" ]] && continue
+
         done_option_id="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].options[]? | select((.name // "") | ascii_downcase == "done") | .id' | head -1)"
         done_option_name="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].options[]? | select((.name // "") | ascii_downcase == "done") | .name' | head -1)"
-        if [[ -z "$done_option_id" ]]; then
-            continue
-        fi
+        [[ -z "$done_option_id" ]] && continue
 
-        for target in "${targets[@]}"; do
-            matching_ids="$(echo "$items" | jq -r --argjson n "$target" '.items[]? | select((.content.number // 0) == $n) | .id' 2>/dev/null)"
-            [[ -z "$matching_ids" ]] && continue
-
-            while IFS= read -r item_id; do
-                [[ -z "$item_id" ]] && continue
-                info "Moving item linked to ${B_MAGENTA}#${target}${RESET} in ${BOLD}${project_title}${RESET} → ${B_GREEN}${done_option_name}${RESET}…"
-                if run gh project item-edit \
-                        --id "$item_id" \
-                        --field-id "$status_field_id" \
-                        --project-id "$project_id" \
-                        --single-select-option-id "$done_option_id" >/dev/null; then
-                    ok "Moved ${project_title}/#${target} to ${B_GREEN}${done_option_name}${RESET}"
-                    PROJECT_ITEMS_MOVED+=("${project_title} → ${done_option_name} (#${target})")
-                    moved_any=true
-                else
-                    warn "Could not update project item for #${target} in ${project_title} (continuing)"
-                    PROJECT_ITEMS_FAILED+=("${project_title} (#${target})")
-                fi
-            done <<< "$matching_ids"
-        done
+        # Critical scoping: only items whose .content.repository matches the
+        # current repo AND whose number is one of our targets. Without the
+        # repository filter, items with the same issue number in OTHER repos
+        # inside the same project would be moved (the Colibri/#24 bug).
+        while IFS= read -r match_line; do
+            [[ -z "$match_line" ]] && continue
+            IFS=$'\t' read -r item_id item_url item_number item_title <<< "$match_line"
+            [[ -z "$item_id" ]] && continue
+            CAND_PROJ_TITLE+=("$project_title")
+            CAND_PROJ_ID+=("$project_id")
+            CAND_FIELD_ID+=("$status_field_id")
+            CAND_OPTION_ID+=("$done_option_id")
+            CAND_OPTION_NAME+=("$done_option_name")
+            CAND_ITEM_ID+=("$item_id")
+            CAND_ITEM_URL+=("$item_url")
+            CAND_ITEM_NUMBER+=("$item_number")
+            CAND_ITEM_TITLE+=("$item_title")
+            CAND_SELECTED+=("true")
+        done < <(echo "$items" | jq -r \
+            --arg repo "$REPO" \
+            --argjson nums "$targets_json" \
+            '.items[]?
+             | select((.content.repository // "") == $repo)
+             | (.content.number // 0) as $n
+             | select($nums | index($n))
+             | "\(.id)\t\(.content.url // "")\t\($n)\t\(.content.title // "")"')
     done <<< "$(echo "$projects" | jq -c '.projects[]?')"
 
-    if [[ "$moved_any" != true && ${#PROJECT_ITEMS_FAILED[@]} -eq 0 ]]; then
+    local total=${#CAND_ITEM_ID[@]}
+    if [[ "$total" -eq 0 ]]; then
         info "No matching project items found for PR #${PR_NUMBER} or its linked issues."
+        return 0
+    fi
+
+    # ── Display + toggle (mirrors the labels picker) ───────────────────────
+    echo ""
+    echo -e "${DIM}Project items to move → ${B_GREEN}Done${RESET}${DIM} (preselected shown with ${B_GREEN}●${RESET}${DIM}):${RESET}"
+    local i marker
+    for ((i = 0; i < total; i++)); do
+        marker=" "
+        [[ "${CAND_SELECTED[$i]}" == "true" ]] && marker="${B_GREEN}●${RESET}"
+        printf "  $marker ${B_MAGENTA}%2d)${RESET} ${BOLD}%s${RESET}/${B_MAGENTA}#%s${RESET} ${DIM}— %s${RESET}\n" \
+            "$((i+1))" "${CAND_PROJ_TITLE[$i]}" "${CAND_ITEM_NUMBER[$i]}" "${CAND_ITEM_TITLE[$i]}"
+    done
+    echo ""
+
+    local choices num idx
+    read -rp "$(echo -e "${B_MAGENTA}?${RESET} ${BOLD}Numbers to toggle${RESET} ${DIM}(space-separated, empty to proceed with preselection):${RESET} ")" choices
+
+    for num in $choices; do
+        if [[ "$num" =~ ^[0-9]+$ ]]; then
+            idx=$((num - 1))
+            if [[ "$idx" -ge 0 && "$idx" -lt "$total" ]]; then
+                if [[ "${CAND_SELECTED[$idx]}" == "true" ]]; then
+                    CAND_SELECTED[$idx]="false"
+                else
+                    CAND_SELECTED[$idx]="true"
+                fi
+            fi
+        fi
+    done
+
+    # ── Apply selected items ───────────────────────────────────────────────
+    local any_selected=false
+    for ((i = 0; i < total; i++)); do
+        [[ "${CAND_SELECTED[$i]}" == "true" ]] || continue
+        any_selected=true
+        # Log the exact item URL before mutating so cross-repo regressions
+        # are immediately visible.
+        info "Moving ${BRIGHT_CYAN}${CAND_ITEM_URL[$i]:-#${CAND_ITEM_NUMBER[$i]}}${RESET} in ${BOLD}${CAND_PROJ_TITLE[$i]}${RESET} → ${B_GREEN}${CAND_OPTION_NAME[$i]}${RESET}…"
+        if run gh project item-edit \
+                --id "${CAND_ITEM_ID[$i]}" \
+                --field-id "${CAND_FIELD_ID[$i]}" \
+                --project-id "${CAND_PROJ_ID[$i]}" \
+                --single-select-option-id "${CAND_OPTION_ID[$i]}" >/dev/null; then
+            ok "Moved ${CAND_PROJ_TITLE[$i]}/#${CAND_ITEM_NUMBER[$i]} to ${B_GREEN}${CAND_OPTION_NAME[$i]}${RESET}"
+            PROJECT_ITEMS_MOVED+=("${CAND_PROJ_TITLE[$i]} → ${CAND_OPTION_NAME[$i]} (${CAND_ITEM_URL[$i]:-#${CAND_ITEM_NUMBER[$i]}})")
+        else
+            warn "Could not update ${CAND_ITEM_URL[$i]:-#${CAND_ITEM_NUMBER[$i]}} in ${CAND_PROJ_TITLE[$i]} (continuing)"
+            PROJECT_ITEMS_FAILED+=("${CAND_PROJ_TITLE[$i]} (${CAND_ITEM_URL[$i]:-#${CAND_ITEM_NUMBER[$i]}})")
+        fi
+    done
+
+    if [[ "$any_selected" != true ]]; then
+        info "All items deselected — nothing moved."
     fi
 }
 
@@ -707,13 +857,21 @@ update_project_item() {
 thank_author() {
     if [[ "$NO_THANKS" == true ]]; then
         THANK_STATUS="skipped"
-        return
+        return 0
+    fi
+
+    # Self-merge: skip silently. Don't prompt the user to thank themselves.
+    local me
+    me="$(gh api user --jq .login 2>/dev/null || echo "")"
+    if [[ -n "$me" && "$me" == "$PR_AUTHOR" ]]; then
+        THANK_STATUS="skipped"
+        return 0
     fi
 
     echo ""
     if ! ask_yes_no "Thank ${BRIGHT_CYAN}@${PR_AUTHOR}${RESET} on the PR?" "y"; then
         THANK_STATUS="skipped"
-        return
+        return 0
     fi
 
     if run gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="Thank you @$PR_AUTHOR!" >/dev/null; then
@@ -747,12 +905,11 @@ print_summary() {
 
     local pr_str
     case "$PR_CLOSE_STATUS" in
-        closed)         pr_str="${B_GREEN}✔${RESET} closed (#${PR_NUMBER})" ;;
-        already-closed) pr_str="${DIM}already closed${RESET}" ;;
-        auto-merged)    pr_str="${B_GREEN}✔${RESET} auto-closed by push" ;;
-        skipped)        pr_str="${B_YELLOW}skipped${RESET}" ;;
-        failed)         pr_str="${B_RED}failed${RESET} (close manually)" ;;
-        *)              pr_str="${DIM}—${RESET}" ;;
+        merged)            pr_str="${B_GREEN}✔${RESET} merged (#${PR_NUMBER})" ;;
+        closed-not-merged) pr_str="${B_RED}closed but not merged${RESET} — inspect on GitHub" ;;
+        skipped)           pr_str="${B_YELLOW}skipped${RESET}" ;;
+        failed)            pr_str="${B_RED}failed${RESET}" ;;
+        *)                 pr_str="${DIM}—${RESET}" ;;
     esac
     echo -e "  ${DIM}PR:${RESET}               $pr_str"
 
@@ -933,22 +1090,6 @@ else
     fi
 fi
 
-# ─── Fetch and checkout target branch ────────────────────────────────────────
-
-section "Preparing branches"
-
-info "Fetching from ${BOLD}$REMOTE${RESET}…"
-git fetch "$REMOTE" "$TARGET_BRANCH" "$PR_HEAD_REF" 2>/dev/null \
-    || git fetch "$REMOTE" "$TARGET_BRANCH" 2>/dev/null \
-    || die "Could not fetch branch $TARGET_BRANCH from $REMOTE"
-
-git fetch "$REMOTE" "pull/${PR_NUMBER}/head:pr-${PR_NUMBER}" 2>/dev/null \
-    || die "Could not fetch PR #${PR_NUMBER} head"
-
-info "Checking out ${B_GREEN}${TARGET_BRANCH}${RESET}…"
-git checkout "$TARGET_BRANCH" 2>/dev/null || die "Could not checkout $TARGET_BRANCH"
-git reset --hard "$REMOTE/$TARGET_BRANCH" >/dev/null 2>&1
-
 # ─── Build merge commit message ──────────────────────────────────────────────
 
 # Strip any existing conventional-commit prefix from PR title
@@ -963,76 +1104,45 @@ else
     MERGE_MSG="$(printf '%s (#%s)' "$PR_TITLE" "$PR_NUMBER")"
 fi
 
-# ─── Merge ───────────────────────────────────────────────────────────────────
-
-section "Merging"
-
-if [[ "$SQUASH" == true ]]; then
-    info "Squash-merging PR #${PR_NUMBER}…"
-    if [[ "$DRY_RUN" == true ]]; then
-        run git merge --squash "pr-${PR_NUMBER}"
-    else
-        git merge --squash "pr-${PR_NUMBER}" >/dev/null 2>&1 \
-            || die "Merge failed. Resolve conflicts and run: git commit"
-    fi
-
-    if [[ "$NO_COMMIT" == true ]]; then
-        ok "Squash-merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
-    else
-        if run git commit -m "$MERGE_MSG" >/dev/null 2>&1; then
-            ok "Squash-merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
-        else
-            [[ "$DRY_RUN" == true ]] || die "Squash commit failed"
-        fi
-    fi
-else
-    info "Merge-committing PR #${PR_NUMBER}…"
-
-    if [[ "$NO_COMMIT" == true ]]; then
-        if [[ "$DRY_RUN" == true ]]; then
-            run git merge --no-ff --no-commit "pr-${PR_NUMBER}"
-        else
-            git merge --no-ff --no-commit "pr-${PR_NUMBER}" >/dev/null 2>&1 \
-                || die "Merge failed. Resolve conflicts and run: git commit"
-        fi
-        ok "Merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
-    else
-        if [[ "$DRY_RUN" == true ]]; then
-            run git merge --no-ff -m "$MERGE_MSG" "pr-${PR_NUMBER}"
-        else
-            git merge --no-ff -m "$MERGE_MSG" "pr-${PR_NUMBER}" >/dev/null 2>&1 \
-                || die "Merge failed. Resolve conflicts, then: git commit"
-        fi
-        ok "Merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
-    fi
-fi
-
-# Capture the merge commit SHA before any subsequent commits (version bump),
-# so PR / issue close comments can reference exactly the merged commit.
-if [[ "$NO_COMMIT" == false ]]; then
-    if [[ "$DRY_RUN" == true ]]; then
-        SQUASH_SHA="<dry-run-sha>"
-    else
-        SQUASH_SHA="$(git rev-parse --short=12 HEAD)"
-    fi
-fi
-
-git branch -D "pr-${PR_NUMBER}" >/dev/null 2>&1 || true
-
-# ─── Version bump ────────────────────────────────────────────────────────────
-
-if [[ "$NO_COMMIT" == false ]]; then
-    manage_version_bump
-fi
-
-# ─── Remote wrap-up ──────────────────────────────────────────────────────────
+# ─── Execute the merge ───────────────────────────────────────────────────────
 
 if [[ "$NO_COMMIT" == true ]]; then
+    # Inspection-only path: do a local merge with --no-commit, then stop.
+    # Useful for reviewing the cumulative diff before running for real.
+    section "Local merge for inspection (--no-commit)"
+
+    info "Fetching ${BOLD}$TARGET_BRANCH${RESET} and PR head…"
+    git fetch "$REMOTE" "$TARGET_BRANCH" 2>/dev/null \
+        || die "Could not fetch branch $TARGET_BRANCH from $REMOTE"
+    git fetch "$REMOTE" "pull/${PR_NUMBER}/head:pr-${PR_NUMBER}" 2>/dev/null \
+        || die "Could not fetch PR #${PR_NUMBER} head"
+
+    info "Checking out ${B_GREEN}${TARGET_BRANCH}${RESET}…"
+    git checkout "$TARGET_BRANCH" 2>/dev/null || die "Could not checkout $TARGET_BRANCH"
+    git reset --hard "$REMOTE/$TARGET_BRANCH" >/dev/null 2>&1
+
+    if [[ "$SQUASH" == true ]]; then
+        git merge --squash "pr-${PR_NUMBER}" >/dev/null 2>&1 \
+            || die "Merge failed. Resolve conflicts and run: git commit"
+        ok "Squash-merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
+    else
+        git merge --no-ff --no-commit "pr-${PR_NUMBER}" >/dev/null 2>&1 \
+            || die "Merge failed. Resolve conflicts and run: git commit"
+        ok "Merged (no commit). Review with: ${BOLD}git diff --cached${RESET}"
+    fi
+
+    git branch -D "pr-${PR_NUMBER}" >/dev/null 2>&1 || true
+
     section "Local merge complete"
     info "Skipping push / close / project steps because of --no-commit."
     info "Review with ${BOLD}git diff --cached${RESET}, finish the commit, then push manually."
     echo ""
 else
+    # Default path: let GitHub perform the merge. This is what makes the PR
+    # show as MERGED (not just closed) and triggers auto-rebase of stacked
+    # PRs when the head branch is deleted.
+    merge_on_github
+    manage_version_bump
     push_changes
     close_pr
     close_linked_issues
