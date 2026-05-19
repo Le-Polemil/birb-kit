@@ -463,6 +463,38 @@ extract_linked_issues() {
         | awk '!seen[$0]++'
 }
 
+# ─── Re-target dependent stacked PRs ────────────────────────────────────────
+
+# Finds any open PR in the same repo whose base branch is the current PR's
+# head branch (i.e. PRs stacked on top of this one) and re-targets them to
+# this PR's destination branch. Must run BEFORE `gh pr merge --delete-branch`
+# — otherwise the branch deletion auto-closes them.
+retarget_stacked_prs() {
+    local stacked_json
+    stacked_json="$(gh pr list --repo "$REPO" --state open --base "$PR_HEAD_REF" \
+        --json number,title,headRefName 2>/dev/null || echo "[]")"
+
+    local stacked_count
+    stacked_count="$(echo "$stacked_json" | jq 'length' 2>/dev/null || echo 0)"
+    [[ "$stacked_count" -eq 0 ]] && return 0
+
+    section "Re-targeting stacked PRs"
+    info "Found ${BOLD}${stacked_count}${RESET} PR(s) stacked on ${YELLOW}${PR_HEAD_REF}${RESET}. Moving their base to ${B_GREEN}${TARGET_BRANCH}${RESET}…"
+
+    local n title
+    while IFS=$'\t' read -r n title; do
+        [[ -z "$n" ]] && continue
+        info "  PR #${n} ${DIM}— ${title}${RESET}"
+        if run gh pr edit "$n" --repo "$REPO" --base "$TARGET_BRANCH" >/dev/null; then
+            ok "  Re-targeted #${n} → ${B_GREEN}${TARGET_BRANCH}${RESET}"
+            STACKED_PRS_REBASED+=("$n")
+        else
+            warn "  Failed to re-target #${n} (it will be auto-closed when ${PR_HEAD_REF} is deleted)"
+            STACKED_PRS_FAILED+=("$n")
+        fi
+    done < <(echo "$stacked_json" | jq -r '.[] | "\(.number)\t\(.title)"')
+}
+
 # ─── GitHub-side merge ───────────────────────────────────────────────────────
 
 # Performs the merge via `gh pr merge`, i.e. on GitHub's own side. This is
@@ -470,11 +502,12 @@ extract_linked_issues() {
 #   • Mark the PR as MERGED (not just CLOSED). A local squash + push leaves
 #     the squashed SHA unrelated to the PR head, so GitHub flags the PR as
 #     plainly closed.
-#   • Auto-rebase stacked PRs. When --delete-branch removes the head branch,
-#     GitHub re-targets any PR whose base was that branch onto its parent.
-#     Manual branch deletion (gh pr close --delete-branch) skips that step
-#     and instead auto-CLOSES the stacked PRs — the bug we're fixing.
 #   • Auto-close issues referenced via "closes #N" in the PR body.
+#
+# Stacked PRs are NOT auto-rebased by GitHub when their base branch gets
+# deleted — they're auto-CLOSED. The script handles this explicitly by
+# re-targeting any open PR whose base is the about-to-be-deleted head
+# branch BEFORE calling `gh pr merge --delete-branch`.
 merge_on_github() {
     section "Merging on GitHub"
 
@@ -487,6 +520,21 @@ merge_on_github() {
         fi
     fi
 
+    # Only delete the branch when the PR head is in the same repo (gh would
+    # error trying to delete a fork's branch).
+    local same_repo
+    same_repo="$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "") == (.base.repo.full_name // "")')"
+
+    # Re-target dependent stacked PRs before --delete-branch removes the
+    # head branch out from under them. GitHub closes a PR when its base
+    # branch is deleted (it doesn't auto-rebase to the parent base, despite
+    # what the merge UI text sometimes suggests). Skip when --no-delete or
+    # forked head: in those cases the head branch survives the merge and
+    # dependents stay valid.
+    if [[ "$same_repo" == "true" ]]; then
+        retarget_stacked_prs
+    fi
+
     local merge_args=("pr" "merge" "$PR_NUMBER" "--repo" "$REPO" "--subject" "$MERGE_MSG")
     if [[ "$SQUASH" == true ]]; then
         # Empty --body keeps the squash commit clean (default is the
@@ -495,12 +543,6 @@ merge_on_github() {
     else
         merge_args+=("--merge")
     fi
-
-    # Only delete the branch when the PR head is in the same repo (gh would
-    # error trying to delete a fork's branch). Deleting the head branch is
-    # what triggers GitHub's auto-rebase of stacked PRs.
-    local same_repo
-    same_repo="$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "") == (.base.repo.full_name // "")')"
     [[ "$same_repo" == "true" ]] && merge_args+=("--delete-branch")
 
     info "Asking GitHub to ${SQUASH:+squash-}merge PR #${PR_NUMBER}…"
@@ -944,6 +986,17 @@ print_summary() {
     [[ -z "$proj_str" ]] && proj_str="${DIM}—${RESET}"
     echo -e "  ${DIM}Project board:${RESET}    $proj_str"
 
+    local stacked_str=""
+    if [[ ${#STACKED_PRS_REBASED[@]} -gt 0 ]]; then
+        stacked_str="${B_GREEN}✔${RESET} re-targeted: #$(IFS=,; echo "${STACKED_PRS_REBASED[*]}")"
+    fi
+    if [[ ${#STACKED_PRS_FAILED[@]} -gt 0 ]]; then
+        [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
+        stacked_str="${stacked_str}${B_RED}failed: #$(IFS=,; echo "${STACKED_PRS_FAILED[*]}")${RESET}"
+    fi
+    [[ -z "$stacked_str" ]] && stacked_str="${DIM}—${RESET}"
+    echo -e "  ${DIM}Stacked PRs:${RESET}      $stacked_str"
+
     local thank_str
     case "$THANK_STATUS" in
         posted)  thank_str="${B_GREEN}✔${RESET} posted" ;;
@@ -981,6 +1034,8 @@ SKIPPED_ISSUES=()
 FAILED_ISSUES=()
 PROJECT_ITEMS_MOVED=()
 PROJECT_ITEMS_FAILED=()
+STACKED_PRS_REBASED=()
+STACKED_PRS_FAILED=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
