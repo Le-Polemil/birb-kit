@@ -465,21 +465,24 @@ extract_linked_issues() {
 
 # ─── Re-target dependent stacked PRs ────────────────────────────────────────
 
-# Finds any open PR in the same repo whose base branch is the current PR's
-# head branch (i.e. PRs stacked on top of this one) and re-targets them to
-# this PR's destination branch. Must run BEFORE `gh pr merge --delete-branch`
-# — otherwise the branch deletion auto-closes them.
+# Finds any open PR whose base is the current PR's head branch (i.e. PRs
+# stacked on top of this one) and re-targets each to the current PR's
+# destination branch on GitHub. Stashes the full JSON in STACKED_PRS_JSON
+# so rebase_stacked_branches (called post-merge) can rebase each stacked
+# branch's commits onto the new base and force-push.
+#
+# Must run BEFORE `gh pr merge --delete-branch` — otherwise the branch
+# deletion auto-closes the dependents before we can re-target them.
 retarget_stacked_prs() {
-    local stacked_json
-    stacked_json="$(gh pr list --repo "$REPO" --state open --base "$PR_HEAD_REF" \
-        --json number,title,headRefName 2>/dev/null || echo "[]")"
+    STACKED_PRS_JSON="$(gh pr list --repo "$REPO" --state open --base "$PR_HEAD_REF" \
+        --json number,title,headRefName,headRepository 2>/dev/null || echo "[]")"
 
     local stacked_count
-    stacked_count="$(echo "$stacked_json" | jq 'length' 2>/dev/null || echo 0)"
+    stacked_count="$(echo "$STACKED_PRS_JSON" | jq 'length' 2>/dev/null || echo 0)"
     [[ "$stacked_count" -eq 0 ]] && return 0
 
     section "Re-targeting stacked PRs"
-    info "Found ${BOLD}${stacked_count}${RESET} PR(s) stacked on ${YELLOW}${PR_HEAD_REF}${RESET}. Moving their base to ${B_GREEN}${TARGET_BRANCH}${RESET}…"
+    info "Found ${BOLD}${stacked_count}${RESET} PR(s) stacked on ${YELLOW}${PR_HEAD_REF}${RESET}. Moving each onto ${B_GREEN}${TARGET_BRANCH}${RESET}…"
 
     local n title
     while IFS=$'\t' read -r n title; do
@@ -487,12 +490,112 @@ retarget_stacked_prs() {
         info "  PR #${n} ${DIM}— ${title}${RESET}"
         if run gh pr edit "$n" --repo "$REPO" --base "$TARGET_BRANCH" >/dev/null; then
             ok "  Re-targeted #${n} → ${B_GREEN}${TARGET_BRANCH}${RESET}"
-            STACKED_PRS_REBASED+=("$n")
+            # Provisional: bucket as retarget-only here, and rebase_stacked_branches
+            # promotes it to FULL_OK if the local rebase + force-push also succeed.
+            STACKED_PRS_RETARGET_ONLY+=("$n")
         else
             warn "  Failed to re-target #${n} (it will be auto-closed when ${PR_HEAD_REF} is deleted)"
             STACKED_PRS_FAILED+=("$n")
         fi
-    done < <(echo "$stacked_json" | jq -r '.[] | "\(.number)\t\(.title)"')
+    done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.title)"')
+}
+
+# Removes $1 from STACKED_PRS_RETARGET_ONLY and appends it to STACKED_PRS_FULL_OK.
+_promote_stacked_pr() {
+    local target="$1"
+    local i kept=()
+    for i in "${STACKED_PRS_RETARGET_ONLY[@]}"; do
+        [[ "$i" == "$target" ]] && continue
+        kept+=("$i")
+    done
+    STACKED_PRS_RETARGET_ONLY=("${kept[@]}")
+    STACKED_PRS_FULL_OK+=("$target")
+}
+
+# ─── Rebase stacked branches locally + force-push ──────────────────────────
+
+# After a squash or rebase merge, the merged PR's commits land on the
+# target branch with NEW SHAs. Stacked branches still hold the old SHAs
+# in their history, so even after re-targeting the base on GitHub, the
+# diff against the new base contains "phantom" reapplied commits — and
+# GitHub flags conflicts whenever the squash collapsed lines that the
+# original commits touched separately.
+#
+# Fix: replay each stacked branch's exclusive commits on top of the new
+# base via `git rebase --onto <new-base> <old-head-sha>`, then force-push
+# with --force-with-lease. Works on a detached HEAD so it doesn't disturb
+# any local checkout state the user has on those branches; updates the
+# local ref to match the rebased SHA at the end.
+#
+# Skipped:
+#   • Forks: we can't force-push to someone else's repo. The re-target
+#     still happened, so the stacked PR survives — the contributor just
+#     has to rebase their fork themselves.
+#   • Real conflicts: aborted cleanly; the stacked PR is left with its
+#     new base but pre-rebase commits, awaiting manual resolution.
+rebase_stacked_branches() {
+    [[ -z "$STACKED_PRS_JSON" ]] && return 0
+    local count
+    count="$(echo "$STACKED_PRS_JSON" | jq 'length' 2>/dev/null || echo 0)"
+    [[ "$count" -eq 0 ]] && return 0
+    [[ ${#STACKED_PRS_RETARGET_ONLY[@]} -eq 0 ]] && return 0
+
+    section "Rebasing stacked branches locally"
+    info "Replaying each stacked branch's exclusive commits on top of ${B_GREEN}${TARGET_BRANCH}${RESET} and force-pushing (--force-with-lease)."
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "$STACKED_PRS_JSON" | jq -r --arg r "$REMOTE" --arg t "$TARGET_BRANCH" --arg b "$PR_HEAD_SHA" \
+            '.[] | "  [dry-run] git fetch \($r) \(.headRefName) && git checkout --detach \($r)/\(.headRefName) && git rebase --onto \($r)/\($t) \($b) && git push --force-with-lease \($r) HEAD:refs/heads/\(.headRefName)"'
+        return 0
+    fi
+
+    local n head_ref head_repo
+    while IFS=$'\t' read -r n head_ref head_repo; do
+        [[ -z "$n" ]] && continue
+
+        # Skip forks — force-push would require write access to a repo
+        # we don't own.
+        if [[ "$head_repo" != "$REPO" ]]; then
+            info "  #${n}: head in ${head_repo} (fork) — base re-targeted, manual rebase needed by the contributor."
+            continue
+        fi
+
+        info "  Rebasing #${n} (${YELLOW}${head_ref}${RESET}) onto ${B_GREEN}${TARGET_BRANCH}${RESET}…"
+
+        if ! git fetch "$REMOTE" "$head_ref" >/dev/null 2>&1; then
+            warn "  Could not fetch ${head_ref}; skip"
+            continue
+        fi
+
+        # Work on a detached HEAD so we don't disturb any local branch the
+        # user may have checked out previously.
+        if ! git checkout --detach "$REMOTE/$head_ref" >/dev/null 2>&1; then
+            warn "  Could not check out ${REMOTE}/${head_ref}; skip"
+            continue
+        fi
+
+        if ! git rebase --onto "$REMOTE/$TARGET_BRANCH" "$PR_HEAD_SHA" >/dev/null 2>&1; then
+            warn "  Rebase conflict on #${n}; aborting. Manual rebase needed."
+            git rebase --abort >/dev/null 2>&1 || true
+            continue
+        fi
+
+        if git push --force-with-lease "$REMOTE" "HEAD:refs/heads/$head_ref" >/dev/null 2>&1; then
+            ok "  #${n} rebased + force-pushed"
+            # Update the local branch ref (if any) to match the rebased SHA,
+            # so a later `git checkout <head_ref>` doesn't show stale commits.
+            if git show-ref --verify --quiet "refs/heads/$head_ref"; then
+                git branch -f "$head_ref" HEAD >/dev/null 2>&1
+            fi
+            _promote_stacked_pr "$n"
+        else
+            warn "  #${n} rebased locally but force-push failed (lease blocked? push permission?). Inspect manually."
+        fi
+    done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.headRepository.nameWithOwner // "")"')
+
+    # Always return to the target branch — subsequent steps (version
+    # bump, project board, summary) assume we're on it.
+    git checkout "$TARGET_BRANCH" >/dev/null 2>&1 || true
 }
 
 # ─── GitHub-side merge ───────────────────────────────────────────────────────
@@ -572,6 +675,11 @@ merge_on_github() {
     PUSHED_BRANCH=true
     ok "Merged: ${BOLD}${B_GREEN}$MERGE_MSG${RESET}"
     ok "Commit: ${BOLD}${SQUASH_SHA}${RESET}"
+
+    # Rebase each stacked branch on top of the just-merged target so the
+    # phantom-conflict picture (squashed history vs. original commits) clears
+    # up before the operator looks at the dependent PRs.
+    rebase_stacked_branches
 }
 
 # ─── Push step ───────────────────────────────────────────────────────────────
@@ -987,8 +1095,12 @@ print_summary() {
     echo -e "  ${DIM}Project board:${RESET}    $proj_str"
 
     local stacked_str=""
-    if [[ ${#STACKED_PRS_REBASED[@]} -gt 0 ]]; then
-        stacked_str="${B_GREEN}✔${RESET} re-targeted: #$(IFS=,; echo "${STACKED_PRS_REBASED[*]}")"
+    if [[ ${#STACKED_PRS_FULL_OK[@]} -gt 0 ]]; then
+        stacked_str="${B_GREEN}✔${RESET} re-targeted + rebased: #$(IFS=,; echo "${STACKED_PRS_FULL_OK[*]}")"
+    fi
+    if [[ ${#STACKED_PRS_RETARGET_ONLY[@]} -gt 0 ]]; then
+        [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
+        stacked_str="${stacked_str}${B_YELLOW}re-targeted only (manual rebase): #$(IFS=,; echo "${STACKED_PRS_RETARGET_ONLY[*]}")${RESET}"
     fi
     if [[ ${#STACKED_PRS_FAILED[@]} -gt 0 ]]; then
         [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
@@ -1034,8 +1146,10 @@ SKIPPED_ISSUES=()
 FAILED_ISSUES=()
 PROJECT_ITEMS_MOVED=()
 PROJECT_ITEMS_FAILED=()
-STACKED_PRS_REBASED=()
-STACKED_PRS_FAILED=()
+STACKED_PRS_FULL_OK=()         # re-targeted + locally rebased + force-pushed
+STACKED_PRS_RETARGET_ONLY=()   # re-targeted on GitHub; local rebase skipped/failed
+STACKED_PRS_FAILED=()          # couldn't even re-target
+STACKED_PRS_JSON=""            # raw gh-pr-list output for the rebase pass
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1095,6 +1209,7 @@ PR_TITLE="$(echo "$PR_JSON" | jq -r '.title')"
 PR_STATE="$(echo "$PR_JSON" | jq -r '.state')"
 PR_AUTHOR="$(echo "$PR_JSON" | jq -r '.user.login')"
 PR_HEAD_REF="$(echo "$PR_JSON" | jq -r '.head.ref')"
+PR_HEAD_SHA="$(echo "$PR_JSON" | jq -r '.head.sha')"
 PR_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref')"
 PR_MERGED="$(echo "$PR_JSON" | jq -r '.merged')"
 
