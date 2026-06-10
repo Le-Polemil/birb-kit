@@ -475,7 +475,7 @@ extract_linked_issues() {
 # deletion auto-closes the dependents before we can re-target them.
 retarget_stacked_prs() {
     STACKED_PRS_JSON="$(gh pr list --repo "$REPO" --state open --base "$PR_HEAD_REF" \
-        --json number,title,headRefName,headRepository 2>/dev/null || echo "[]")"
+        --json number,title,headRefName,isCrossRepository 2>/dev/null || echo "[]")"
 
     local stacked_count
     stacked_count="$(echo "$STACKED_PRS_JSON" | jq 'length' 2>/dev/null || echo 0)"
@@ -549,14 +549,15 @@ rebase_stacked_branches() {
         return 0
     fi
 
-    local n head_ref head_repo
-    while IFS=$'\t' read -r n head_ref head_repo; do
+    local n head_ref cross_repo
+    while IFS=$'\t' read -r n head_ref cross_repo; do
         [[ -z "$n" ]] && continue
 
         # Skip forks — force-push would require write access to a repo
-        # we don't own.
-        if [[ "$head_repo" != "$REPO" ]]; then
-            info "  #${n}: head in ${head_repo} (fork) — base re-targeted, manual rebase needed by the contributor."
+        # we don't own. isCrossRepository is the only fork signal gh pr list
+        # actually populates (headRepository.nameWithOwner comes back empty).
+        if [[ "$cross_repo" == "true" ]]; then
+            info "  #${n}: head lives in a fork — base re-targeted, manual rebase needed by the contributor."
             continue
         fi
 
@@ -591,7 +592,7 @@ rebase_stacked_branches() {
         else
             warn "  #${n} rebased locally but force-push failed (lease blocked? push permission?). Inspect manually."
         fi
-    done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.headRepository.nameWithOwner // "")"')
+    done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.isCrossRepository)"')
 
     # Always return to the target branch — subsequent steps (version
     # bump, project board, summary) assume we're on it.
