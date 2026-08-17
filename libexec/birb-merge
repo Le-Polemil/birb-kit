@@ -504,11 +504,14 @@ retarget_stacked_prs() {
 _promote_stacked_pr() {
     local target="$1"
     local i kept=()
-    for i in "${STACKED_PRS_RETARGET_ONLY[@]}"; do
+    # ${arr[@]+"${arr[@]}"} guards the empty-array case: under `set -u`,
+    # bash 3.2 (still macOS's /bin/bash) treats a bare "${arr[@]}" on an
+    # empty array as an unbound-variable error and aborts.
+    for i in ${STACKED_PRS_RETARGET_ONLY[@]+"${STACKED_PRS_RETARGET_ONLY[@]}"}; do
         [[ "$i" == "$target" ]] && continue
         kept+=("$i")
     done
-    STACKED_PRS_RETARGET_ONLY=("${kept[@]}")
+    STACKED_PRS_RETARGET_ONLY=(${kept[@]+"${kept[@]}"})
     STACKED_PRS_FULL_OK+=("$target")
 }
 
