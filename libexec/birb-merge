@@ -500,6 +500,79 @@ retarget_stacked_prs() {
     done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.title)"')
 }
 
+# Brings every remote branch into remote-tracking refs once, plus this PR's
+# head (via refs/pull/N/head, which works for forks too), so containment
+# checks can run locally with git instead of one compare API call per PR.
+ensure_fetched() {
+    [[ "$FETCHED_REMOTE" == true ]] && return 0
+    git fetch --quiet "$REMOTE" >/dev/null 2>&1 || true
+    git cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null \
+        || git fetch --quiet "$REMOTE" "refs/pull/${PR_NUMBER}/head" >/dev/null 2>&1 || true
+    FETCHED_REMOTE=true
+    return 0
+}
+
+# retarget_stacked_prs only sees dependents whose base IS this PR's head
+# branch. That misses the branch that actually bites: a dependent whose base
+# was re-pointed to the target early — manually, or by an earlier birb run
+# further down the stack — while its head still CONTAINS this PR's commits.
+# It stops looking stacked, so nothing replays it; then this PR gets
+# squash-merged, the same changes land on the target under a new SHA, and
+# git (which compares from the last common ancestor, not by content) reports
+# the same lines edited twice. That is the phantom conflict that surfaces on
+# the *next* merge, long after the run that caused it.
+#
+# Detection is by history containment, not by base ref: their head contains
+# $PR_HEAD_SHA and is not equal to it.
+#
+# Only PRs already based on $TARGET_BRANCH qualify. One based on some other
+# branch belongs to a deeper stack, and replaying it onto $TARGET_BRANCH
+# would flatten the branch it legitimately sits on.
+find_descendant_prs() {
+    local all candidates
+    all="$(gh pr list --repo "$REPO" --state open --limit 100 \
+        --json number,title,headRefName,headRefOid,baseRefName,isCrossRepository 2>/dev/null || echo "[]")"
+    [[ -z "$all" || "$all" == "[]" ]] && return 0
+
+    candidates="$(echo "$all" | jq -c \
+        --argjson skip "$(echo "${STACKED_PRS_JSON:-[]}" | jq '[.[].number]' 2>/dev/null || echo '[]')" \
+        --argjson self "$PR_NUMBER" \
+        --arg t "$TARGET_BRANCH" \
+        '[ .[]
+           | select(.number != $self)
+           | select(.baseRefName == $t)
+           | select(.isCrossRepository | not)
+           | select(.number as $n | ($skip | index($n) | not)) ]' 2>/dev/null || echo "[]")"
+    [[ "$(echo "$candidates" | jq 'length' 2>/dev/null || echo 0)" -eq 0 ]] && return 0
+
+    ensure_fetched
+    git cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null || return 0
+
+    local found="[]" n title head_ref head_oid
+    while IFS=$'\t' read -r n title head_ref head_oid; do
+        [[ -z "$n" || -z "$head_oid" ]] && continue
+        [[ "$head_oid" == "$PR_HEAD_SHA" ]] && continue
+        git cat-file -e "${head_oid}^{commit}" 2>/dev/null || continue
+        git merge-base --is-ancestor "$PR_HEAD_SHA" "$head_oid" 2>/dev/null || continue
+        found="$(echo "$found" | jq -c \
+            --argjson n "$n" --arg t "$title" --arg h "$head_ref" \
+            '. + [{number: $n, title: $t, headRefName: $h, isCrossRepository: false}]')"
+    done < <(echo "$candidates" | jq -r '.[] | "\(.number)\t\(.title)\t\(.headRefName)\t\(.headRefOid)"')
+
+    [[ "$(echo "$found" | jq 'length')" -eq 0 ]] && return 0
+    DESCENDANT_PRS_JSON="$found"
+
+    section "Dependent branches carrying these commits"
+    info "Already based on ${B_GREEN}${TARGET_BRANCH}${RESET}, but their history still holds #${PR_NUMBER}'s commits."
+    info "Left alone they would phantom-conflict on their own merge, so they get replayed too:"
+    local m mt
+    while IFS=$'\t' read -r m mt; do
+        [[ -z "$m" ]] && continue
+        info "  PR #${m} ${DIM}— ${mt}${RESET}"
+    done < <(echo "$found" | jq -r '.[] | "\(.number)\t\(.title)"')
+    return 0
+}
+
 # Removes $1 from STACKED_PRS_RETARGET_ONLY and appends it to STACKED_PRS_FULL_OK.
 _promote_stacked_pr() {
     local target="$1"
@@ -536,70 +609,240 @@ _promote_stacked_pr() {
 #     has to rebase their fork themselves.
 #   • Real conflicts: aborted cleanly; the stacked PR is left with its
 #     new base but pre-rebase commits, awaiting manual resolution.
-rebase_stacked_branches() {
-    [[ -z "$STACKED_PRS_JSON" ]] && return 0
-    local count
-    count="$(echo "$STACKED_PRS_JSON" | jq 'length' 2>/dev/null || echo 0)"
-    [[ "$count" -eq 0 ]] && return 0
-    [[ ${#STACKED_PRS_RETARGET_ONLY[@]} -eq 0 ]] && return 0
+# Replays one branch's exclusive commits — everything it holds after
+# <cut sha> — onto the merged target, then force-pushes. Leaves HEAD
+# detached; callers restore it. Returns 0 only when the remote branch
+# actually ended up rebased.
+_rebase_one_branch() {
+    local n="$1" head_ref="$2" cross_repo="$3" cut_sha="$4"
 
-    section "Rebasing stacked branches locally"
-    info "Replaying each stacked branch's exclusive commits on top of ${B_GREEN}${TARGET_BRANCH}${RESET} and force-pushing (--force-with-lease)."
+    # Skip forks — force-push would require write access to a repo we don't
+    # own. isCrossRepository is the only fork signal gh pr list actually
+    # populates (headRepository.nameWithOwner comes back empty).
+    if [[ "$cross_repo" == "true" ]]; then
+        info "  #${n}: head lives in a fork — manual rebase needed by the contributor."
+        return 1
+    fi
+
+    info "  Rebasing #${n} (${YELLOW}${head_ref}${RESET}) onto ${B_GREEN}${TARGET_BRANCH}${RESET}…"
+
+    if ! git fetch "$REMOTE" "$head_ref" >/dev/null 2>&1; then
+        warn "  Could not fetch ${head_ref}; skip"
+        return 1
+    fi
+
+    # Work on a detached HEAD so we don't disturb any local branch the
+    # user may have checked out previously.
+    if ! git checkout --detach "$REMOTE/$head_ref" >/dev/null 2>&1; then
+        warn "  Could not check out ${REMOTE}/${head_ref}; skip"
+        return 1
+    fi
+
+    if ! git rebase --onto "$REMOTE/$TARGET_BRANCH" "$cut_sha" >/dev/null 2>&1; then
+        warn "  Rebase conflict on #${n}; aborting. Manual rebase needed."
+        git rebase --abort >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! git push --force-with-lease "$REMOTE" "HEAD:refs/heads/$head_ref" >/dev/null 2>&1; then
+        warn "  #${n} rebased locally but force-push failed (lease blocked? push permission?). Inspect manually."
+        return 1
+    fi
+
+    ok "  #${n} rebased + force-pushed"
+    # Update the local branch ref (if any) to match the rebased SHA, so a
+    # later `git checkout <head_ref>` doesn't show stale commits.
+    if git show-ref --verify --quiet "refs/heads/$head_ref"; then
+        git branch -f "$head_ref" HEAD >/dev/null 2>&1
+    fi
+    return 0
+}
+
+rebase_stacked_branches() {
+    local stacked_count=0 descendant_count=0
+    if [[ -n "$STACKED_PRS_JSON" && ${#STACKED_PRS_RETARGET_ONLY[@]} -gt 0 ]]; then
+        stacked_count="$(echo "$STACKED_PRS_JSON" | jq 'length' 2>/dev/null || echo 0)"
+    fi
+    if [[ -n "$DESCENDANT_PRS_JSON" ]]; then
+        descendant_count="$(echo "$DESCENDANT_PRS_JSON" | jq 'length' 2>/dev/null || echo 0)"
+    fi
+    [[ "$stacked_count" -eq 0 && "$descendant_count" -eq 0 ]] && return 0
+
+    section "Rebasing dependent branches locally"
+    info "Replaying each dependent branch's exclusive commits on top of ${B_GREEN}${TARGET_BRANCH}${RESET} and force-pushing (--force-with-lease)."
 
     if [[ "$DRY_RUN" == true ]]; then
-        echo "$STACKED_PRS_JSON" | jq -r --arg r "$REMOTE" --arg t "$TARGET_BRANCH" --arg b "$PR_HEAD_SHA" \
-            '.[] | "  [dry-run] git fetch \($r) \(.headRefName) && git checkout --detach \($r)/\(.headRefName) && git rebase --onto \($r)/\($t) \($b) && git push --force-with-lease \($r) HEAD:refs/heads/\(.headRefName)"'
+        local blob
+        for blob in "$STACKED_PRS_JSON" "$DESCENDANT_PRS_JSON"; do
+            [[ -z "$blob" ]] && continue
+            echo "$blob" | jq -r --arg r "$REMOTE" --arg t "$TARGET_BRANCH" --arg b "$PR_HEAD_SHA" \
+                '.[] | "  [dry-run] git fetch \($r) \(.headRefName) && git checkout --detach \($r)/\(.headRefName) && git rebase --onto \($r)/\($t) \($b) && git push --force-with-lease \($r) HEAD:refs/heads/\(.headRefName)"'
+        done
         return 0
     fi
 
     local n head_ref cross_repo
-    while IFS=$'\t' read -r n head_ref cross_repo; do
-        [[ -z "$n" ]] && continue
 
-        # Skip forks — force-push would require write access to a repo
-        # we don't own. isCrossRepository is the only fork signal gh pr list
-        # actually populates (headRepository.nameWithOwner comes back empty).
-        if [[ "$cross_repo" == "true" ]]; then
-            info "  #${n}: head lives in a fork — base re-targeted, manual rebase needed by the contributor."
-            continue
-        fi
-
-        info "  Rebasing #${n} (${YELLOW}${head_ref}${RESET}) onto ${B_GREEN}${TARGET_BRANCH}${RESET}…"
-
-        if ! git fetch "$REMOTE" "$head_ref" >/dev/null 2>&1; then
-            warn "  Could not fetch ${head_ref}; skip"
-            continue
-        fi
-
-        # Work on a detached HEAD so we don't disturb any local branch the
-        # user may have checked out previously.
-        if ! git checkout --detach "$REMOTE/$head_ref" >/dev/null 2>&1; then
-            warn "  Could not check out ${REMOTE}/${head_ref}; skip"
-            continue
-        fi
-
-        if ! git rebase --onto "$REMOTE/$TARGET_BRANCH" "$PR_HEAD_SHA" >/dev/null 2>&1; then
-            warn "  Rebase conflict on #${n}; aborting. Manual rebase needed."
-            git rebase --abort >/dev/null 2>&1 || true
-            continue
-        fi
-
-        if git push --force-with-lease "$REMOTE" "HEAD:refs/heads/$head_ref" >/dev/null 2>&1; then
-            ok "  #${n} rebased + force-pushed"
-            # Update the local branch ref (if any) to match the rebased SHA,
-            # so a later `git checkout <head_ref>` doesn't show stale commits.
-            if git show-ref --verify --quiet "refs/heads/$head_ref"; then
-                git branch -f "$head_ref" HEAD >/dev/null 2>&1
+    if [[ "$stacked_count" -gt 0 ]]; then
+        while IFS=$'\t' read -r n head_ref cross_repo; do
+            [[ -z "$n" ]] && continue
+            if _rebase_one_branch "$n" "$head_ref" "$cross_repo" "$PR_HEAD_SHA"; then
+                _promote_stacked_pr "$n"
             fi
-            _promote_stacked_pr "$n"
-        else
-            warn "  #${n} rebased locally but force-push failed (lease blocked? push permission?). Inspect manually."
-        fi
-    done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.isCrossRepository)"')
+        done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.isCrossRepository)"')
+    fi
+
+    # Same replay, different bucket: these were never re-targeted (they
+    # already point at the target branch), they only carry our commits.
+    if [[ "$descendant_count" -gt 0 ]]; then
+        while IFS=$'\t' read -r n head_ref cross_repo; do
+            [[ -z "$n" ]] && continue
+            if _rebase_one_branch "$n" "$head_ref" "$cross_repo" "$PR_HEAD_SHA"; then
+                DESCENDANT_PRS_REBASED+=("$n")
+            else
+                DESCENDANT_PRS_STALE+=("$n")
+            fi
+        done < <(echo "$DESCENDANT_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.isCrossRepository)"')
+    fi
 
     # Always return to the target branch — subsequent steps (version
     # bump, project board, summary) assume we're on it.
     git checkout "$TARGET_BRANCH" >/dev/null 2>&1 || true
+}
+
+# ─── Merge-failure diagnosis + recovery ──────────────────────────────────────
+
+# gh surfaces a DIRTY merge state as "the merge commit cannot be cleanly
+# created", which reads like a content conflict. In a stacked workflow it
+# usually isn't one: this PR's head still carries the ORIGINAL commits of a
+# PR that was squash-merged into the base. The squash rebuilt those changes
+# as one new commit that is an ancestor of nothing, so git compares the two
+# sides from the pre-squash ancestor and sees the same lines edited twice.
+#
+# Prints "<pr number>\t<their pre-merge head sha>" for the most recent such
+# PR — that SHA is exactly the cut point a recovery rebase needs. Returns 1
+# when no squashed ancestor explains the conflict.
+find_squashed_ancestor_pr() {
+    ensure_fetched
+    git cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null || return 1
+
+    local merged n head_oid merge_sha
+    merged="$(gh pr list --repo "$REPO" --state merged --base "$TARGET_BRANCH" --limit 20 \
+        --json number,headRefOid,mergeCommit 2>/dev/null || echo "[]")"
+
+    # Newest first, so the first match is the deepest cut point — anything
+    # older is already contained in it.
+    while IFS=$'\t' read -r n head_oid merge_sha; do
+        [[ -z "$n" || -z "$head_oid" ]] && continue
+
+        # Their pre-merge head must still be in our history…
+        git cat-file -e "${head_oid}^{commit}" 2>/dev/null || continue
+        git merge-base --is-ancestor "$head_oid" "$PR_HEAD_SHA" 2>/dev/null || continue
+
+        # …and their merge commit must not be, or this branch was rebased
+        # after that merge and something else explains the conflict.
+        if [[ -n "$merge_sha" ]] && git cat-file -e "${merge_sha}^{commit}" 2>/dev/null; then
+            git merge-base --is-ancestor "$merge_sha" "$PR_HEAD_SHA" 2>/dev/null && continue
+        fi
+
+        printf '%s\t%s\n' "$n" "$head_oid"
+        return 0
+    done < <(echo "$merged" | jq -r '.[] | "\(.number)\t\(.headRefOid)\t\(.mergeCommit.oid // "")"')
+
+    return 1
+}
+
+# GitHub recomputes mergeability asynchronously: right after a force-push
+# `mergeable` comes back null and gh refuses with "try again in a few
+# seconds". Polling here saves the operator a manual re-run.
+wait_for_mergeable() {
+    local i state
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        state="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.mergeable' 2>/dev/null || echo "null")"
+        case "$state" in
+            true)  return 0 ;;
+            false) return 1 ;;
+        esac
+        sleep 2
+    done
+    # Still unknown after ~20s — let gh pr merge have the final word.
+    return 0
+}
+
+# Called when `gh pr merge` refuses. Says what GitHub actually objected to
+# and, for the squash phantom-conflict case, offers to replay this branch
+# onto the target and retry. Returns 0 when the branch was rebased and the
+# merge is worth another attempt.
+attempt_merge_recovery() {
+    local state
+    state="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.mergeable_state // "unknown"' 2>/dev/null || echo "unknown")"
+
+    case "$state" in
+        dirty) ;;
+        blocked)
+            warn "GitHub state: ${BOLD}blocked${RESET} — required reviews or checks aren't satisfied."
+            return 1 ;;
+        behind)
+            warn "GitHub state: ${BOLD}behind${RESET} — branch protection wants the head up to date with the base."
+            info "Update it with ${DIM}gh pr update-branch ${PR_NUMBER} --repo ${REPO}${RESET}, then re-run."
+            return 1 ;;
+        draft)
+            warn "GitHub state: ${BOLD}draft${RESET} — mark the PR ready for review first."
+            return 1 ;;
+        unknown)
+            warn "GitHub hasn't finished computing mergeability. Re-run in a few seconds."
+            return 1 ;;
+        *)
+            warn "GitHub state: ${BOLD}${state}${RESET}."
+            return 1 ;;
+    esac
+
+    section "Diagnosing the conflict"
+
+    local culprit culprit_pr cut_sha
+    if ! culprit="$(find_squashed_ancestor_pr)"; then
+        warn "Real content conflict with ${B_GREEN}${TARGET_BRANCH}${RESET} — nothing in this branch's history was squashed away behind its back."
+        info "Resolve it locally, push, then re-run."
+        return 1
+    fi
+
+    culprit_pr="${culprit%%$'\t'*}"
+    cut_sha="${culprit##*$'\t'}"
+
+    warn "Not a real content conflict: ${YELLOW}${PR_HEAD_REF}${RESET} still carries the original commits of #${culprit_pr}, which was ${BOLD}squash-merged${RESET} into ${B_GREEN}${TARGET_BRANCH}${RESET}."
+    info "The squash rebuilt those changes under a new SHA, so git compares both sides from before it and sees the same lines edited twice."
+    info "Fix — replay this branch's own commits on top of ${B_GREEN}${TARGET_BRANCH}${RESET}:"
+    echo -e "    ${DIM}git rebase --onto ${REMOTE}/${TARGET_BRANCH} ${cut_sha} ${PR_HEAD_REF}${RESET}"
+    echo -e "    ${DIM}git push --force-with-lease ${REMOTE} ${PR_HEAD_REF}${RESET}"
+    echo ""
+
+    local same_repo
+    same_repo="$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "") == (.base.repo.full_name // "")')"
+    if [[ "$same_repo" != "true" ]]; then
+        warn "The head lives in a fork — only its owner can force-push that fix."
+        return 1
+    fi
+
+    ask_yes_no "Do that now and retry the merge?" "y" || return 1
+
+    local orig_ref rebased=1
+    orig_ref="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || git rev-parse HEAD 2>/dev/null || echo "")"
+
+    # NB: PR_HEAD_SHA deliberately keeps its pre-rebase value. Dependent
+    # branches still descend from the old SHA, so it stays the correct cut
+    # point for rebase_stacked_branches after the merge lands.
+    if _rebase_one_branch "$PR_NUMBER" "$PR_HEAD_REF" "false" "$cut_sha"; then
+        rebased=0
+    fi
+    [[ -n "$orig_ref" ]] && git checkout "$orig_ref" >/dev/null 2>&1 || true
+    [[ "$rebased" -eq 0 ]] || return 1
+
+    info "Waiting for GitHub to recompute mergeability…"
+    if ! wait_for_mergeable; then
+        warn "GitHub still reports the PR as not mergeable. Inspect it manually."
+        return 1
+    fi
+    return 0
 }
 
 # ─── GitHub-side merge ───────────────────────────────────────────────────────
@@ -642,6 +885,10 @@ merge_on_github() {
         retarget_stacked_prs
     fi
 
+    # Dependents that stopped looking stacked (base already re-pointed) but
+    # still carry this PR's commits need the very same replay.
+    find_descendant_prs
+
     local merge_args=("pr" "merge" "$PR_NUMBER" "--repo" "$REPO" "--subject" "$MERGE_MSG")
     if [[ "$SQUASH" == true ]]; then
         # Empty --body keeps the squash commit clean (default is the
@@ -654,7 +901,13 @@ merge_on_github() {
 
     info "Asking GitHub to ${SQUASH:+squash-}merge PR #${PR_NUMBER}…"
     if ! run gh "${merge_args[@]}"; then
-        die "GitHub refused the merge. Check for conflicts, required reviews, or failing checks; then re-run."
+        if attempt_merge_recovery; then
+            info "Retrying the merge…"
+            run gh "${merge_args[@]}" \
+                || die "GitHub still refused the merge after the rebase. Inspect PR #${PR_NUMBER}."
+        else
+            die "GitHub refused the merge. Fix what's reported above, then re-run."
+        fi
     fi
 
     PR_CLOSE_STATUS="merged"
@@ -662,6 +915,9 @@ merge_on_github() {
     if [[ "$DRY_RUN" == true ]]; then
         SQUASH_SHA="<dry-run-sha>"
         ok "Would merge PR #${PR_NUMBER} on GitHub and pull the result."
+        # Print the replay plan too — it mutates nothing, and it's the part
+        # of the run worth previewing before trusting it with force-pushes.
+        rebase_stacked_branches
         return 0
     fi
 
@@ -1110,6 +1366,14 @@ print_summary() {
         [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
         stacked_str="${stacked_str}${B_RED}failed: #$(IFS=,; echo "${STACKED_PRS_FAILED[*]}")${RESET}"
     fi
+    if [[ ${#DESCENDANT_PRS_REBASED[@]} -gt 0 ]]; then
+        [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
+        stacked_str="${stacked_str}${B_GREEN}✔${RESET} rebased (carried these commits): #$(IFS=,; echo "${DESCENDANT_PRS_REBASED[*]}")"
+    fi
+    if [[ ${#DESCENDANT_PRS_STALE[@]} -gt 0 ]]; then
+        [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
+        stacked_str="${stacked_str}${B_YELLOW}still carrying these commits (manual rebase): #$(IFS=,; echo "${DESCENDANT_PRS_STALE[*]}")${RESET}"
+    fi
     [[ -z "$stacked_str" ]] && stacked_str="${DIM}—${RESET}"
     echo -e "  ${DIM}Stacked PRs:${RESET}      $stacked_str"
 
@@ -1154,6 +1418,10 @@ STACKED_PRS_FULL_OK=()         # re-targeted + locally rebased + force-pushed
 STACKED_PRS_RETARGET_ONLY=()   # re-targeted on GitHub; local rebase skipped/failed
 STACKED_PRS_FAILED=()          # couldn't even re-target
 STACKED_PRS_JSON=""            # raw gh-pr-list output for the rebase pass
+DESCENDANT_PRS_JSON=""         # open PRs already on the target that carry our commits
+DESCENDANT_PRS_REBASED=()      # …of those, the ones replayed + force-pushed
+DESCENDANT_PRS_STALE=()        # …of those, the ones left carrying squashed commits
+FETCHED_REMOTE=false           # ensure_fetched() runs at most once
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
