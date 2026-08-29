@@ -44,6 +44,21 @@ birb merge 42 --no-close-pr      # Skip closing the PR on GitHub
 birb merge 42 --no-close-issue   # Skip closing any linked issue
 birb merge 42 --no-project-update # Skip moving the project item to "Done"
 
+# Pre-answer the prompts (scriptable / non-interactive)
+birb merge 42 --yes                       # Take the default on every prompt
+birb merge 42 -y --type=feat --bump=patch # …and pick type + version bump
+birb merge 42 -y --no-squash --no-tag     # Merge commit, no tag
+birb merge 42 --labels='+ready,-wip'      # Apply labels without prompting
+```
+
+`--yes` (alias `--accept-default`) answers each remaining prompt with the
+default shown in its hint: no type prefix, labels untouched, no version bump,
+squash, keep the project-item preselection, thank the author. `--type`,
+`--bump`, `--squash`/`--no-squash`, `--tag`/`--no-tag` and `--labels` override
+individual prompts and work with or without `--yes` — pass them alone and the
+other prompts still ask.
+
+```bash
 birb review 42                       # Review PR #42 (senior-engineer persona)
 birb review 42 --persona=security    # security / perf / ux / senior
 birb review 42 --checkout            # Check out the PR branch locally first
