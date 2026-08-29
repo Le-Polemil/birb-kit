@@ -96,8 +96,39 @@ Every step is idempotent and skippable:
   logged as warnings and the run continues.
 
 The final summary prints what landed: merge SHA, tag, what was pushed, PR
-close status, closed/skipped/failed issues, project board moves, and
-thank-you status.
+close status, closed/skipped/failed issues, project board moves, dependent
+branches replayed, and thank-you status.
+
+## Stacked PRs and the squash phantom conflict
+
+A squash-merge rebuilds the PR's changes as one new commit that is an
+ancestor of nothing. Any branch still holding the *original* commits now
+shares no recent ancestor with the target, so git compares both sides from
+before the squash and reports the same lines edited twice — a conflict on
+identical content. `birb merge` handles this on two fronts:
+
+- **Before the merge**, it finds every dependent branch and replays it after
+  the merge with `git rebase --onto <target> <merged head sha>`, then
+  force-pushes (`--force-with-lease`). Dependents are found two ways:
+  by base ref (PRs stacked directly on the merged head) *and* by history
+  containment — an open PR already based on the target branch whose head
+  still contains the merged commits. The second case is the one that bites:
+  once a dependent's base has been re-pointed (manually, or by an earlier
+  `birb merge` further down the stack) it stops looking stacked while still
+  carrying the commits, and nothing replays it. The conflict then surfaces
+  on *its* merge, long after the run that caused it.
+- **When `gh pr merge` refuses**, it reads the real `mergeable_state` instead
+  of guessing. For `dirty` it looks for a recently squash-merged PR whose
+  pre-merge head is still in this branch's history, names it, prints the
+  exact recovery command, and offers to run it and retry the merge.
+  `blocked`, `behind`, `draft` and `unknown` each get their own message.
+
+Deeper stacks still need care: rebasing a dependent rewrites *its* head, so
+anything stacked on **that** branch is left behind and must be replayed in
+turn. `birb merge` replays one level per run.
+
+A branch in a fork is never force-pushed — it's reported so its owner can
+rebase.
 
 ## Manual verification
 
@@ -113,5 +144,8 @@ throwaway PR in a personal repo:
 | Missing `project` OAuth scope | revoke project scope, then run | "Could not list projects for `<owner>` (missing 'project' scope?). Skipping." with the `gh auth refresh` hint. |
 | Fork PR | merge a PR opened from a fork | PR closes **without** `--delete-branch` (gh doesn't try to delete the fork's branch). |
 | Idempotent rerun | run twice in a row on the same PR | Second run reports "PR #N already merged on GitHub", "Issue #N already closed", and the project item update is a no-op. |
+| Stacked dependent | PR B stacked on PR A, merge A | B re-targeted, replayed onto the target, force-pushed; summary shows "re-targeted + rebased". |
+| Dependent already re-pointed | B's base set to `main` by hand, then merge A | B is still found (its head contains A's commits) and replayed; summary shows "rebased (carried these commits)". |
+| Phantom conflict on merge | merge a PR whose head carries a squash-merged PR's commits | Diagnosis names the culprit PR, prints the `git rebase --onto` command, offers to run it, then retries the merge. |
 | Happy path | `birb merge <N>` end-to-end | Summary shows push ✔, PR closed ✔, issue closed ✔, project item moved ✔, thank-you posted ✔. |
 
