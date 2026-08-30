@@ -108,9 +108,28 @@ identical content. `birb merge` handles this on two fronts:
   exact recovery command, and offers to run it and retry the merge.
   `blocked`, `behind`, `draft` and `unknown` each get their own message.
 
-Deeper stacks still need care: rebasing a dependent rewrites *its* head, so
-anything stacked on **that** branch is left behind and must be replayed in
-turn. `birb merge` replays one level per run.
+Rebasing a dependent rewrites *its* head, so anything stacked on **that**
+branch would be left behind in turn. Each successful replay therefore
+queues the PRs based on the branch it just rewrote, with
+`--onto <new parent head> <old parent head>`, and walks the stack
+breadth-first down to 5 levels. A three-deep stack lands in one run.
+
+### Finding the cut point
+
+`--onto <cut>` only replays what comes *after* `<cut>`, so the cut has to be
+the newest commit the branch carries that the target already has. Matching
+merged PRs by head SHA finds only the ones merged straight from the branch
+in front of you: a branch can carry several squashed ancestors, and the ones
+further up the stack are usually rebased copies — same patch, different SHA.
+Cutting at the oldest of them replays commits the target already has, which
+conflicts again.
+
+So the cut is found by `git patch-id`, which a rebase preserves: the newest
+commit whose patch-id matches a commit already landed by a merged PR. The
+same trick recovers a branch that was left behind by an earlier rewrite and
+no longer descends from its recorded cut point at all — its cut is
+recomputed against the branch it should be sitting on, rather than forcing a
+rebase from a meaningless point.
 
 A branch in a fork is never force-pushed — it's reported so its owner can
 rebase.
@@ -132,5 +151,8 @@ throwaway PR in a personal repo:
 | Stacked dependent | PR B stacked on PR A, merge A | B re-targeted, replayed onto the target, force-pushed; summary shows "re-targeted + rebased". |
 | Dependent already re-pointed | B's base set to `main` by hand, then merge A | B is still found (its head contains A's commits) and replayed; summary shows "rebased (carried these commits)". |
 | Phantom conflict on merge | merge a PR whose head carries a squash-merged PR's commits | Diagnosis names the culprit PR, prints the `git rebase --onto` command, offers to run it, then retries the merge. |
+| Several squashed ancestors | merge the top of a three-deep stack after the two below it landed | Cut point found by patch-id at the *newest* already-landed commit, not the oldest; replay leaves only the PR's own commits. |
+| Three-deep stack | A ← B ← C, merge A | B replayed onto the target, then C replayed onto B's new head; C stays stacked on B and both merge clean. |
+| Branch left behind | rebase B by hand without C, then merge B | C's cut point is recomputed by patch-id and it is replayed onto the target instead of failing. |
 | Happy path | `birb merge <N>` end-to-end | Summary shows push ✔, PR closed ✔, issue closed ✔, project item moved ✔, thank-you posted ✔. |
 

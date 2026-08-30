@@ -613,8 +613,12 @@ _promote_stacked_pr() {
 # <cut sha> — onto the merged target, then force-pushes. Leaves HEAD
 # detached; callers restore it. Returns 0 only when the remote branch
 # actually ended up rebased.
+REBASED_OLD_SHA=""
+REBASED_NEW_SHA=""
 _rebase_one_branch() {
-    local n="$1" head_ref="$2" cross_repo="$3" cut_sha="$4"
+    local n="$1" head_ref="$2" cross_repo="$3" cut_sha="$4" onto="${5:-$REMOTE/$TARGET_BRANCH}"
+    REBASED_OLD_SHA=""
+    REBASED_NEW_SHA=""
 
     # Skip forks — force-push would require write access to a repo we don't
     # own. isCrossRepository is the only fork signal gh pr list actually
@@ -624,12 +628,17 @@ _rebase_one_branch() {
         return 1
     fi
 
-    info "  Rebasing #${n} (${YELLOW}${head_ref}${RESET}) onto ${B_GREEN}${TARGET_BRANCH}${RESET}…"
+    local onto_label="${onto#$REMOTE/}"
+    if [[ "$onto_label" == "$onto" ]]; then
+        onto_label="$(git rev-parse --short=8 "$onto" 2>/dev/null || echo "$onto")"
+    fi
+    info "  Rebasing #${n} (${YELLOW}${head_ref}${RESET}) onto ${B_GREEN}${onto_label}${RESET}…"
 
     if ! git fetch "$REMOTE" "$head_ref" >/dev/null 2>&1; then
         warn "  Could not fetch ${head_ref}; skip"
         return 1
     fi
+    REBASED_OLD_SHA="$(git rev-parse "$REMOTE/$head_ref" 2>/dev/null || echo "")"
 
     # Work on a detached HEAD so we don't disturb any local branch the
     # user may have checked out previously.
@@ -638,7 +647,7 @@ _rebase_one_branch() {
         return 1
     fi
 
-    if ! git rebase --onto "$REMOTE/$TARGET_BRANCH" "$cut_sha" >/dev/null 2>&1; then
+    if ! git rebase --onto "$onto" "$cut_sha" >/dev/null 2>&1; then
         warn "  Rebase conflict on #${n}; aborting. Manual rebase needed."
         git rebase --abort >/dev/null 2>&1 || true
         return 1
@@ -649,12 +658,50 @@ _rebase_one_branch() {
         return 1
     fi
 
+    REBASED_NEW_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
     ok "  #${n} rebased + force-pushed"
     # Update the local branch ref (if any) to match the rebased SHA, so a
     # later `git checkout <head_ref>` doesn't show stale commits.
     if git show-ref --verify --quiet "refs/heads/$head_ref"; then
         git branch -f "$head_ref" HEAD >/dev/null 2>&1
     fi
+    return 0
+}
+
+# ─── Cascade queue ──────────────────────────────────────────────────────────
+#
+# Rewriting a branch orphans whatever sits on top of it: the child still
+# holds the parent's OLD commits, so it meets the same phantom conflict one
+# level up. That is how a three-deep stack ends up unmergeable after the
+# bottom PR lands. Every successful replay therefore looks for PRs based on
+# the branch it just rewrote and queues them with
+# `--onto <new parent head> <old parent head>`, down to CASCADE_MAX_DEPTH.
+CASCADE_MAX_DEPTH=5
+_CQ_N=(); _CQ_REF=(); _CQ_CROSS=(); _CQ_CUT=(); _CQ_ONTO=(); _CQ_DEPTH=(); _CQ_KIND=()
+_CQ_SEEN=""
+
+# $1=number $2=head ref $3=cross-repo $4=cut sha $5=onto $6=depth $7=kind
+_cq_push() {
+    case " $_CQ_SEEN " in *" $1 "*) return 0 ;; esac
+    _CQ_SEEN="$_CQ_SEEN $1"
+    _CQ_N+=("$1"); _CQ_REF+=("$2"); _CQ_CROSS+=("$3"); _CQ_CUT+=("$4")
+    _CQ_ONTO+=("$5"); _CQ_DEPTH+=("$6"); _CQ_KIND+=("$7")
+    return 0
+}
+
+# Queues every open PR based on the branch we just rewrote, so it lands on
+# that branch's new head instead of the commits that no longer exist.
+_cq_push_children() {
+    local parent_ref="$1" old_sha="$2" new_sha="$3" depth="$4"
+    local kids n title head_ref cross
+    kids="$(gh pr list --repo "$REPO" --state open --base "$parent_ref" \
+        --json number,title,headRefName,isCrossRepository 2>/dev/null || echo "[]")"
+    while IFS=$'\t' read -r n title head_ref cross; do
+        [[ -z "$n" ]] && continue
+        case " $_CQ_SEEN " in *" $n "*) continue ;; esac
+        info "  ↳ #${n} sits on ${YELLOW}${parent_ref}${RESET} ${DIM}— queued for replay onto its new head${RESET}"
+        _cq_push "$n" "$head_ref" "$cross" "$old_sha" "$new_sha" "$depth" "cascade"
+    done < <(echo "$kids" | jq -r '.[] | "\(.number)\t\(.title)\t\(.headRefName)\t\(.isCrossRepository)"')
     return 0
 }
 
@@ -678,17 +725,17 @@ rebase_stacked_branches() {
             echo "$blob" | jq -r --arg r "$REMOTE" --arg t "$TARGET_BRANCH" --arg b "$PR_HEAD_SHA" \
                 '.[] | "  [dry-run] git fetch \($r) \(.headRefName) && git checkout --detach \($r)/\(.headRefName) && git rebase --onto \($r)/\($t) \($b) && git push --force-with-lease \($r) HEAD:refs/heads/\(.headRefName)"'
         done
+        info "  ${DIM}[dry-run] whatever is stacked on those branches gets replayed too, one level at a time (up to ${CASCADE_MAX_DEPTH}).${RESET}"
         return 0
     fi
 
     local n head_ref cross_repo
+    _CQ_SEEN=" $PR_NUMBER "
 
     if [[ "$stacked_count" -gt 0 ]]; then
         while IFS=$'\t' read -r n head_ref cross_repo; do
             [[ -z "$n" ]] && continue
-            if _rebase_one_branch "$n" "$head_ref" "$cross_repo" "$PR_HEAD_SHA"; then
-                _promote_stacked_pr "$n"
-            fi
+            _cq_push "$n" "$head_ref" "$cross_repo" "$PR_HEAD_SHA" "$REMOTE/$TARGET_BRANCH" 0 "stacked"
         done < <(echo "$STACKED_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.isCrossRepository)"')
     fi
 
@@ -697,13 +744,69 @@ rebase_stacked_branches() {
     if [[ "$descendant_count" -gt 0 ]]; then
         while IFS=$'\t' read -r n head_ref cross_repo; do
             [[ -z "$n" ]] && continue
-            if _rebase_one_branch "$n" "$head_ref" "$cross_repo" "$PR_HEAD_SHA"; then
-                DESCENDANT_PRS_REBASED+=("$n")
-            else
-                DESCENDANT_PRS_STALE+=("$n")
-            fi
+            _cq_push "$n" "$head_ref" "$cross_repo" "$PR_HEAD_SHA" "$REMOTE/$TARGET_BRANCH" 0 "descendant"
         done < <(echo "$DESCENDANT_PRS_JSON" | jq -r '.[] | "\(.number)\t\(.headRefName)\t\(.isCrossRepository)"')
     fi
+
+    # The queue grows as replays land: each success can append its own
+    # dependents, so this walks the stack breadth-first.
+    local i=0 kind depth cut onto old_sha new_sha
+    while [[ $i -lt ${#_CQ_N[@]} ]]; do
+        n="${_CQ_N[$i]}"; head_ref="${_CQ_REF[$i]}"; cross_repo="${_CQ_CROSS[$i]}"
+        cut="${_CQ_CUT[$i]}"; onto="${_CQ_ONTO[$i]}"
+        depth="${_CQ_DEPTH[$i]}"; kind="${_CQ_KIND[$i]}"
+        i=$((i + 1))
+
+        # A branch that doesn't contain its cut point was left behind by an
+        # earlier rewrite, so the recorded cut is meaningless for it —
+        # rebasing from there would replay commits the target already has
+        # (the very failure this whole pass exists to prevent). Recompute
+        # the cut by patch-id instead of forcing a bogus rebase.
+        git fetch "$REMOTE" "$head_ref" >/dev/null 2>&1 || true
+        if ! git merge-base --is-ancestor "$cut" "$REMOTE/$head_ref" 2>/dev/null; then
+            local recut=""
+            if [[ "$kind" == "cascade" ]]; then
+                # Its work starts after the parent's, wherever those commits
+                # ended up.
+                recut="$(_cut_point_against "$REMOTE/$head_ref" "$onto" 2>/dev/null || echo "")"
+            else
+                # Nothing left to stack on: replay its own commits onto the
+                # target, cutting at the newest already-landed one.
+                recut="$(find_squashed_ancestor_pr "$(git rev-parse "$REMOTE/$head_ref" 2>/dev/null || echo "")" 2>/dev/null || echo "")"
+                recut="${recut##*$'\t'}"
+                onto="$REMOTE/$TARGET_BRANCH"
+            fi
+            if [[ -n "$recut" ]]; then
+                info "  #${n} was left behind by an earlier rewrite — recomputed its cut point (${recut:0:8})."
+                cut="$recut"
+            else
+                warn "  #${n} doesn't descend from what it was stacked on, and no cut point could be recomputed. Manual rebase needed."
+                case "$kind" in
+                    stacked)    ;;
+                    descendant) DESCENDANT_PRS_STALE+=("$n") ;;
+                    cascade)    CASCADED_PRS_FAILED+=("$n") ;;
+                esac
+                continue
+            fi
+        fi
+
+        if _rebase_one_branch "$n" "$head_ref" "$cross_repo" "$cut" "$onto"; then
+            old_sha="$REBASED_OLD_SHA"; new_sha="$REBASED_NEW_SHA"
+            case "$kind" in
+                stacked)    _promote_stacked_pr "$n" ;;
+                descendant) DESCENDANT_PRS_REBASED+=("$n") ;;
+                cascade)    CASCADED_PRS_OK+=("$n") ;;
+            esac
+            if [[ "$depth" -lt "$CASCADE_MAX_DEPTH" && -n "$old_sha" && -n "$new_sha" ]]; then
+                _cq_push_children "$head_ref" "$old_sha" "$new_sha" "$((depth + 1))"
+            fi
+        else
+            case "$kind" in
+                descendant) DESCENDANT_PRS_STALE+=("$n") ;;
+                cascade)    CASCADED_PRS_FAILED+=("$n") ;;
+            esac
+        fi
+    done
 
     # Always return to the target branch — subsequent steps (version
     # bump, project board, summary) assume we're on it.
@@ -719,35 +822,106 @@ rebase_stacked_branches() {
 # as one new commit that is an ancestor of nothing, so git compares the two
 # sides from the pre-squash ancestor and sees the same lines edited twice.
 #
-# Prints "<pr number>\t<their pre-merge head sha>" for the most recent such
-# PR — that SHA is exactly the cut point a recovery rebase needs. Returns 1
-# when no squashed ancestor explains the conflict.
-find_squashed_ancestor_pr() {
-    ensure_fetched
-    git cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null || return 1
+# Matching is by patch-id, not by SHA. A branch can carry SEVERAL squashed
+# ancestors, and the ones from higher up the stack are usually rebased
+# copies — same patch, different SHA — so a SHA match finds only the oldest
+# of them and cutting there still replays commits the target already has.
+# A rebase preserves patch-ids, so the newest commit of ours whose patch-id
+# a merged PR already landed is the correct cut point whatever happened to
+# the SHAs.
+#
+# Prints "<pr number>\t<cut sha>". Returns 1 when nothing explains the
+# conflict.
+_patch_id() {
+    git show --no-color "$1" 2>/dev/null | git patch-id --stable 2>/dev/null | awk '{print $1}'
+}
 
-    local merged n head_oid merge_sha
-    merged="$(gh pr list --repo "$REPO" --state merged --base "$TARGET_BRANCH" --limit 20 \
-        --json number,headRefOid,mergeCommit 2>/dev/null || echo "[]")"
+# One round trip for every merged PR head we need to inspect. refs/pull/N/head
+# survives the merge and the branch deletion, forks included.
+_fetch_pull_heads() {
+    local n refspecs=()
+    for n in "$@"; do
+        refspecs+=("refs/pull/${n}/head")
+    done
+    [[ ${#refspecs[@]} -eq 0 ]] && return 0
+    git fetch --quiet "$REMOTE" ${refspecs[@]+"${refspecs[@]}"} >/dev/null 2>&1 || true
+    return 0
+}
 
-    # Newest first, so the first match is the deepest cut point — anything
-    # older is already contained in it.
-    while IFS=$'\t' read -r n head_oid merge_sha; do
-        [[ -z "$n" || -z "$head_oid" ]] && continue
+# $1: head to inspect, defaults to the PR being merged.
+# Newest commit of $1 whose patch-id matches a commit $2 contributes on top
+# of the target. That is the cut point for a branch left behind by an
+# earlier rewrite of $2: its own work starts right after that commit, and
+# patch-ids survive the rewrite even though the SHAs don't.
+_cut_point_against() {
+    local head="$1" parent="$2" pbase hbase theirs="" c pid
+    pbase="$(git merge-base "$REMOTE/$TARGET_BRANCH" "$parent" 2>/dev/null || echo "")"
+    hbase="$(git merge-base "$REMOTE/$TARGET_BRANCH" "$head" 2>/dev/null || echo "")"
+    [[ -z "$pbase" || -z "$hbase" ]] && return 1
 
-        # Their pre-merge head must still be in our history…
-        git cat-file -e "${head_oid}^{commit}" 2>/dev/null || continue
-        git merge-base --is-ancestor "$head_oid" "$PR_HEAD_SHA" 2>/dev/null || continue
+    for c in $(git rev-list "${pbase}..${parent}" 2>/dev/null); do
+        pid="$(_patch_id "$c")"
+        [[ -n "$pid" ]] && theirs="${theirs}${pid}
+"
+    done
+    [[ -z "$theirs" ]] && return 1
 
-        # …and their merge commit must not be, or this branch was rebased
-        # after that merge and something else explains the conflict.
-        if [[ -n "$merge_sha" ]] && git cat-file -e "${merge_sha}^{commit}" 2>/dev/null; then
-            git merge-base --is-ancestor "$merge_sha" "$PR_HEAD_SHA" 2>/dev/null && continue
+    for c in $(git rev-list "${hbase}..${head}" 2>/dev/null); do
+        pid="$(_patch_id "$c")"
+        [[ -z "$pid" ]] && continue
+        if echo "$theirs" | grep -qx "$pid" 2>/dev/null; then
+            echo "$c"
+            return 0
         fi
+    done
+    return 1
+}
 
-        printf '%s\t%s\n' "$n" "$head_oid"
-        return 0
-    done < <(echo "$merged" | jq -r '.[] | "\(.number)\t\(.headRefOid)\t\(.mergeCommit.oid // "")"')
+find_squashed_ancestor_pr() {
+    local head="${1:-$PR_HEAD_SHA}"
+    ensure_fetched
+    git cat-file -e "${head}^{commit}" 2>/dev/null || return 1
+
+    local base ours
+    base="$(git merge-base "$REMOTE/$TARGET_BRANCH" "$head" 2>/dev/null || echo "")"
+    [[ -z "$base" ]] && return 1
+    # Newest first: the first match is the deepest correct cut point.
+    ours="$(git rev-list "${base}..${head}" 2>/dev/null || echo "")"
+    [[ -z "$ours" ]] && return 1
+
+    local merged numbers=() n oid
+    merged="$(gh pr list --repo "$REPO" --state merged --base "$TARGET_BRANCH" --limit 10 \
+        --json number,headRefOid 2>/dev/null || echo "[]")"
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && numbers+=("$n")
+    done < <(echo "$merged" | jq -r '.[].number' 2>/dev/null || true)
+    [[ ${#numbers[@]} -eq 0 ]] && return 1
+    _fetch_pull_heads ${numbers[@]+"${numbers[@]}"}
+
+    # "<patch id> <pr number>" for every commit those PRs contributed.
+    local theirs="" their_base c pid
+    while IFS=$'\t' read -r n oid; do
+        [[ -z "$oid" ]] && continue
+        git cat-file -e "${oid}^{commit}" 2>/dev/null || continue
+        their_base="$(git merge-base "$REMOTE/$TARGET_BRANCH" "$oid" 2>/dev/null || echo "")"
+        [[ -z "$their_base" ]] && continue
+        for c in $(git rev-list "${their_base}..${oid}" 2>/dev/null); do
+            pid="$(_patch_id "$c")"
+            [[ -n "$pid" ]] && theirs="${theirs}${pid} ${n}
+"
+        done
+    done < <(echo "$merged" | jq -r '.[] | "\(.number)\t\(.headRefOid)"')
+    [[ -z "$theirs" ]] && return 1
+
+    for c in $ours; do
+        pid="$(_patch_id "$c")"
+        [[ -z "$pid" ]] && continue
+        n="$(echo "$theirs" | awk -v p="$pid" '$1 == p { print $2; exit }')"
+        if [[ -n "$n" ]]; then
+            printf '%s\t%s\n' "$n" "$c"
+            return 0
+        fi
+    done
 
     return 1
 }
@@ -1374,6 +1548,14 @@ print_summary() {
         [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
         stacked_str="${stacked_str}${B_YELLOW}still carrying these commits (manual rebase): #$(IFS=,; echo "${DESCENDANT_PRS_STALE[*]}")${RESET}"
     fi
+    if [[ ${#CASCADED_PRS_OK[@]} -gt 0 ]]; then
+        [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
+        stacked_str="${stacked_str}${B_GREEN}✔${RESET} cascaded: #$(IFS=,; echo "${CASCADED_PRS_OK[*]}")"
+    fi
+    if [[ ${#CASCADED_PRS_FAILED[@]} -gt 0 ]]; then
+        [[ -n "$stacked_str" ]] && stacked_str="$stacked_str  "
+        stacked_str="${stacked_str}${B_YELLOW}cascade left behind (manual rebase): #$(IFS=,; echo "${CASCADED_PRS_FAILED[*]}")${RESET}"
+    fi
     [[ -z "$stacked_str" ]] && stacked_str="${DIM}—${RESET}"
     echo -e "  ${DIM}Stacked PRs:${RESET}      $stacked_str"
 
@@ -1421,6 +1603,8 @@ STACKED_PRS_JSON=""            # raw gh-pr-list output for the rebase pass
 DESCENDANT_PRS_JSON=""         # open PRs already on the target that carry our commits
 DESCENDANT_PRS_REBASED=()      # …of those, the ones replayed + force-pushed
 DESCENDANT_PRS_STALE=()        # …of those, the ones left carrying squashed commits
+CASCADED_PRS_OK=()             # replayed because the branch under them was rewritten
+CASCADED_PRS_FAILED=()         # …same, but left behind
 FETCHED_REMOTE=false           # ensure_fetched() runs at most once
 
 while [[ $# -gt 0 ]]; do
