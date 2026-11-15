@@ -9,6 +9,7 @@
 #   --no-commit             Merge but don't commit (inspect/tweak first)
 #   --no-thanks             Skip the "thank the author" suggestion
 #   --force-squash          Force squash even with multiple authors
+#   --no-delete             Keep the head branch; leave stacked PRs on it
 #   -y, --yes               Answer every prompt with its default
 #   --type <type>           Pre-answer the change-type prompt
 #   --bump <spec>           Pre-answer the version-bump prompt
@@ -139,6 +140,9 @@ $(echo -e "${BOLD}Options:${RESET}")
                           'git merge --no-commit' for inspection only
   --no-thanks             Skip the "thank the author" comment
   --force-squash          Use --squash even with multiple authors
+  --no-delete             Keep the PR's head branch after the merge, and
+                          leave PRs stacked on it untouched (no re-target,
+                          no rebase). Alias: --keep-branch
   --no-push               Skip pushing the post-merge version-bump commit
                           and any new tag
   --no-close-pr           Skip the post-merge PR confirmation step
@@ -171,6 +175,7 @@ $(echo -e "${BOLD}Examples:${RESET}")
   birb merge 42 --switch=main
   birb merge 42 --no-commit
   birb merge 42 --dry-run
+  birb merge 42 --no-delete
   birb merge 42 --no-project-update --no-close-issue
   birb merge 42 --yes --type=feat --bump=patch
   birb merge 42 -y --type=fix --bump=skip --no-squash --labels='+bug,-wip'
@@ -1024,8 +1029,10 @@ merge_on_github() {
     # what the merge UI text sometimes suggests). Skip when --no-delete or
     # forked head: in those cases the head branch survives the merge and
     # dependents stay valid.
-    if [[ "$same_repo" == "true" ]]; then
+    if [[ "$same_repo" == "true" && "$NO_DELETE" != true ]]; then
         retarget_stacked_prs
+    elif [[ "$same_repo" == "true" ]]; then
+        info "Keeping ${YELLOW}${PR_HEAD_REF}${RESET} (--no-delete): PRs stacked on it stay where they are."
     fi
 
     # Dependents that stopped looking stacked (base already re-pointed) but
@@ -1040,7 +1047,14 @@ merge_on_github() {
     else
         merge_args+=("--merge")
     fi
-    [[ "$same_repo" == "true" ]] && merge_args+=("--delete-branch")
+    if [[ "$same_repo" == "true" && "$NO_DELETE" != true ]]; then
+        merge_args+=("--delete-branch")
+        HEAD_BRANCH_STATUS="deleted"
+    elif [[ "$same_repo" == "true" ]]; then
+        HEAD_BRANCH_STATUS="kept"
+    else
+        HEAD_BRANCH_STATUS="fork"
+    fi
 
     info "Asking GitHub to ${SQUASH:+squash-}merge PR #${PR_NUMBER}…"
     if ! run gh "${merge_args[@]}"; then
@@ -1470,6 +1484,15 @@ print_summary() {
     esac
     echo -e "  ${DIM}PR:${RESET}               $pr_str"
 
+    local head_str
+    case "$HEAD_BRANCH_STATUS" in
+        deleted) head_str="${B_GREEN}✔${RESET} deleted ${DIM}(${PR_HEAD_REF})${RESET}" ;;
+        kept)    head_str="${B_YELLOW}kept${RESET} ${PR_HEAD_REF} ${DIM}(--no-delete)${RESET}" ;;
+        fork)    head_str="${DIM}left on fork (${PR_HEAD_REF})${RESET}" ;;
+        *)       head_str="${DIM}—${RESET}" ;;
+    esac
+    echo -e "  ${DIM}Head branch:${RESET}      $head_str"
+
     local issues_str=""
     if [[ ${#CLOSED_ISSUES[@]} -gt 0 ]]; then
         issues_str="${B_GREEN}✔${RESET} #$(IFS=,; echo "${CLOSED_ISSUES[*]}")"
@@ -1572,6 +1595,7 @@ NO_COMMIT=false
 NO_THANKS=false
 FORCE_SQUASH=false
 NO_PUSH=false
+NO_DELETE=false
 NO_CLOSE_PR=false
 NO_CLOSE_ISSUE=false
 NO_PROJECT_UPDATE=false
@@ -1595,6 +1619,7 @@ SQUASH_SHA=""
 NEW_TAG=""
 PUSHED_BRANCH=false
 PUSHED_TAG=""
+HEAD_BRANCH_STATUS=""     # one of: deleted, kept, fork ("" = merge didn't run)
 PR_CLOSE_STATUS=""        # one of: closed, already-closed, auto-merged, skipped, failed, dry-run
 THANK_STATUS=""           # one of: posted, skipped, failed, dry-run
 CLOSED_ISSUES=()
@@ -1626,6 +1651,8 @@ while [[ $# -gt 0 ]]; do
             FORCE_SQUASH=true; shift ;;
         --no-push)
             NO_PUSH=true; shift ;;
+        --no-delete|--keep-branch)
+            NO_DELETE=true; shift ;;
         --no-close-pr)
             NO_CLOSE_PR=true; shift ;;
         --no-close-issue)
