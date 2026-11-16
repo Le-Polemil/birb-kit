@@ -10,11 +10,27 @@
 
 set -euo pipefail
 
-BIRB_VERSION="0.2.0"
+# Version = latest v* git tag. Filled in, in order of preference, by:
+#   • GitHub release tarballs (what Homebrew installs): export-subst in
+#     .gitattributes expands the $Format placeholder below;
+#   • `make install` from a clone: the Makefile rewrites this line;
+#   • running straight from a clone: `git describe` at runtime.
+BIRB_VERSION='$Format:%(describe:tags=true,match=v[0-9]*)$'
 
 # Resolve the real install directory (follows symlinks)
 BIRB_ROOT="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
 BIRB_LIBEXEC="$BIRB_ROOT/libexec"
+
+# Placeholder still unexpanded → not a release tarball. Only ask git when
+# BIRB_ROOT is itself the clone: an install prefix like /usr/local can sit
+# inside some other repo, whose tags have nothing to do with birb.
+if [[ "$BIRB_VERSION" == '$Format'* ]]; then
+    BIRB_VERSION=""
+    if [[ -e "$BIRB_ROOT/.git" ]]; then
+        BIRB_VERSION="$(git -C "$BIRB_ROOT" describe --tags --match 'v[0-9]*' 2>/dev/null || true)"
+    fi
+fi
+BIRB_VERSION="${BIRB_VERSION:-(unknown version)}"
 
 RED='\033[0;31m'
 CYAN='\033[0;36m'
@@ -23,7 +39,7 @@ RESET='\033[0m'
 
 usage() {
     cat <<EOF
-${BOLD}birb${RESET} v$BIRB_VERSION — Personal CLI toolkit.
+${BOLD}birb${RESET} $BIRB_VERSION — Personal CLI toolkit.
 
 ${BOLD}Usage:${RESET}
   birb <command> [args...]
@@ -48,7 +64,7 @@ if [[ $# -eq 0 ]] || [[ "$1" == "help" ]] || [[ "$1" == "--help" ]] || [[ "$1" =
 fi
 
 if [[ "$1" == "--version" ]] || [[ "$1" == "-V" ]]; then
-    echo "birb v$BIRB_VERSION"
+    echo "birb $BIRB_VERSION"
     exit 0
 fi
 
