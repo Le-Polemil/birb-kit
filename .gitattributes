@@ -1,0 +1,2 @@
+# Expand $Format:…$ in release tarballs so `birb --version` knows its tag.
+bin/birb export-subst
