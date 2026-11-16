@@ -40,6 +40,7 @@ birb merge 42 --force-squash     # Force squash even with multiple authors
 
 birb merge 42 --dry-run          # Preview every mutating command
 birb merge 42 --no-push          # Skip pushing branch + tag
+birb merge 42 --no-delete        # Keep the head branch; stacked PRs stay on it
 birb merge 42 --no-close-pr      # Skip closing the PR on GitHub
 birb merge 42 --no-close-issue   # Skip closing any linked issue
 birb merge 42 --no-project-update # Skip moving the project item to "Done"
@@ -47,6 +48,7 @@ birb merge 42 --no-project-update # Skip moving the project item to "Done"
 # Pre-answer the prompts (scriptable / non-interactive)
 birb merge 42 --yes                       # Take the default on every prompt
 birb merge 42 -y --type=feat --bump=patch # …and pick type + version bump
+birb merge 42 -y --feat --patch           # Same, with the shorthand flags
 birb merge 42 -y --no-squash --no-tag     # Merge commit, no tag
 birb merge 42 --labels='+ready,-wip'      # Apply labels without prompting
 ```
@@ -57,6 +59,11 @@ squash, keep the project-item preselection, thank the author. `--type`,
 `--bump`, `--squash`/`--no-squash`, `--tag`/`--no-tag` and `--labels` override
 individual prompts and work with or without `--yes` — pass them alone and the
 other prompts still ask.
+
+Shorthands: `--patch` / `--minor` / `--major` stand for `--bump=<level>`, and
+every commit type has its own flag (`--feat`, `--fix`, `--chore`, `--docs`, …)
+standing for `--type=<type>`. When the same prompt is answered twice, the last
+flag wins.
 
 ```bash
 birb review 42                       # Review PR #42 (senior-engineer persona)
@@ -89,6 +96,10 @@ Every step is idempotent and skippable:
 - `--dry-run` prints each command and changes nothing.
 - `--no-push` / `--no-close-pr` / `--no-close-issue` / `--no-project-update`
   disable individual steps.
+- `--no-delete` (alias `--keep-branch`) keeps the PR's head branch after the
+  merge. PRs stacked on that branch are left alone: not re-targeted to the
+  merged PR's base, not rebased. PRs already based on the target that carry
+  the merged commits are still replayed.
 - An already-closed PR, an already-closed issue, or a project item that has
   no matching entry is reported as skipped rather than failing the run.
 - Push failure aborts the run (every subsequent step depends on origin
@@ -144,6 +155,7 @@ throwaway PR in a personal repo:
 | Missing `project` OAuth scope | revoke project scope, then run | "Could not list projects for `<owner>` (missing 'project' scope?). Skipping." with the `gh auth refresh` hint. |
 | Fork PR | merge a PR opened from a fork | PR closes **without** `--delete-branch` (gh doesn't try to delete the fork's branch). |
 | Idempotent rerun | run twice in a row on the same PR | Second run reports "PR #N already merged on GitHub", "Issue #N already closed", and the project item update is a no-op. |
+| Keep head branch | PR B stacked on PR A, `birb merge A --no-delete` | A merged, its branch still on the remote; B still based on A's branch, untouched; summary shows "Head branch: kept". |
 | Stacked dependent | PR B stacked on PR A, merge A | B re-targeted, replayed onto the target, force-pushed; summary shows "re-targeted + rebased". |
 | Dependent already re-pointed | B's base set to `main` by hand, then merge A | B is still found (its head contains A's commits) and replayed; summary shows "rebased (carried these commits)". |
 | Phantom conflict on merge | merge a PR whose head carries a squash-merged PR's commits | Diagnosis names the culprit PR, prints the `git rebase --onto` command, offers to run it, then retries the merge. |
