@@ -12,7 +12,9 @@
 #   --no-delete             Keep the head branch; leave stacked PRs on it
 #   -y, --yes               Answer every prompt with its default
 #   --type <type>           Pre-answer the change-type prompt
+#   --feat, --fix, …        Shorthand for --type=<type>
 #   --bump <spec>           Pre-answer the version-bump prompt
+#   --patch/--minor/--major Shorthand for --bump=<level>
 #   --squash/--no-squash    Pre-answer the squash prompt
 #   --tag/--no-tag          Pre-answer the git-tag prompt
 #   --labels <spec>         Apply labels non-interactively
@@ -161,7 +163,11 @@ $(echo -e "${BOLD}Pre-answering the prompts:${RESET}")
   --type <type>           Conventional-commit prefix for the merge commit,
                           or 'none' for no prefix. One of:
 $(commit_type_names | fold -s -w 50 | sed 's/^/                          /')
+  --<type>                Shorthand for --type=<type>: --feat, --fix,
+                          --chore, … (any type listed above)
   --bump <spec>           patch | minor | major | skip | an explicit X.Y.Z
+  --patch, --minor, --major
+                          Shorthand for --bump=patch|minor|major
   --squash, --no-squash   Squash into a single commit, or keep a merge
                           commit (multi-author PRs still need --force-squash)
   --tag, --no-tag         Create the v<version> tag after a bump, or not
@@ -178,6 +184,7 @@ $(echo -e "${BOLD}Examples:${RESET}")
   birb merge 42 --no-delete
   birb merge 42 --no-project-update --no-close-issue
   birb merge 42 --yes --type=feat --bump=patch
+  birb merge 42 -y --feat --minor
   birb merge 42 -y --type=fix --bump=skip --no-squash --labels='+bug,-wip'
 EOF
     exit 0
@@ -1686,8 +1693,16 @@ while [[ $# -gt 0 ]]; do
             PRESET_LABELS="$2"; PRESET_LABELS_SET=true; shift 2 ;;
         --labels=*)
             PRESET_LABELS="${1#*=}"; PRESET_LABELS_SET=true; shift ;;
+        --patch|--minor|--major)
+            set_preset_bump "${1#--}"; shift ;;
         -*)
-            die "Unknown option: $1" ;;
+            # --feat, --fix, --chore, …: one shorthand per COMMIT_TYPES key.
+            # The letters-only guard keeps --1 from matching menu entry #1.
+            if [[ "$1" =~ ^--[a-z]+$ ]] && resolve_commit_type "${1#--}" >/dev/null; then
+                set_preset_type "${1#--}"; shift
+            else
+                die "Unknown option: $1"
+            fi ;;
         *)
             [[ -n "$PR_NUMBER" ]] && die "Unexpected argument: $1"
             PR_NUMBER="$1"; shift ;;

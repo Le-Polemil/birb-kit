@@ -48,6 +48,7 @@ birb merge 42 --no-project-update # Skip moving the project item to "Done"
 # Pre-answer the prompts (scriptable / non-interactive)
 birb merge 42 --yes                       # Take the default on every prompt
 birb merge 42 -y --type=feat --bump=patch # …and pick type + version bump
+birb merge 42 -y --feat --patch           # Same, with the shorthand flags
 birb merge 42 -y --no-squash --no-tag     # Merge commit, no tag
 birb merge 42 --labels='+ready,-wip'      # Apply labels without prompting
 ```
@@ -58,6 +59,11 @@ squash, keep the project-item preselection, thank the author. `--type`,
 `--bump`, `--squash`/`--no-squash`, `--tag`/`--no-tag` and `--labels` override
 individual prompts and work with or without `--yes` — pass them alone and the
 other prompts still ask.
+
+Shorthands: `--patch` / `--minor` / `--major` stand for `--bump=<level>`, and
+every commit type has its own flag (`--feat`, `--fix`, `--chore`, `--docs`, …)
+standing for `--type=<type>`. When the same prompt is answered twice, the last
+flag wins.
 
 ```bash
 birb review 42                       # Review PR #42 (senior-engineer persona)
