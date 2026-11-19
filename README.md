@@ -84,9 +84,9 @@ PR up remotely:
 3. **Close any linked issue** referenced in the PR body via a GitHub closing
    keyword (`Closes #N`, `Fixes #N`, `Resolves #N` and their variants), with
    `--reason completed` and a comment linking back to the merge.
-4. **Move the linked project item to "Done"** — discovers the owner's
-   projects, finds an item linked to the PR or to any closing-keyword issue,
-   then resolves the `Status` field id and `Done` option id by case-
+4. **Move the linked project item to "Done"** — asks the PR and each
+   closing-keyword issue for its project items in a single GraphQL query
+   (~1 point, only open projects owned by the repo owner), then resolves the `Status` field id and `Done` option id by case-
    insensitive name match. Project board updates need the `project` OAuth
    scope; grant it with `gh auth refresh -s project,read:project`.
 5. **Thank the author** (interactive, optional).
