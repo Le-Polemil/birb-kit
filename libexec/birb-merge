@@ -1283,34 +1283,60 @@ update_project_item() {
 
     local owner="${REPO%%/*}"
 
-    local projects
-    if ! projects="$(gh project list --owner "$owner" --format json 2>/dev/null)"; then
-        info "Could not list projects for $owner (missing 'project' scope?). Skipping."
-        info "  Grant it with: ${BOLD}gh auth refresh -s project,read:project${RESET}"
-        return 0
-    fi
-
-    local project_count
-    project_count="$(echo "$projects" | jq '.projects | length' 2>/dev/null || echo 0)"
-    if [[ "$project_count" == "0" || -z "$project_count" ]]; then
-        info "No projects found for $owner. Skipping."
-        return 0
-    fi
-
     # Build target number set: the PR plus any linked issues from the PR body.
     # These are the auto-matched candidates that get preselected (green dot).
     local -a targets=("$PR_NUMBER")
     local linked n
     linked="$(extract_linked_issues)"
     while IFS= read -r n; do
-        [[ -n "$n" ]] && targets+=("$n")
+        [[ -n "$n" && "$n" != "$PR_NUMBER" ]] && targets+=("$n")
     done <<< "$linked"
 
-    # JSON array literal for the jq filter. Safe to inline — every entry has
-    # already been validated as an integer (PR_NUMBER) or matched by digit
-    # regex (extract_linked_issues).
-    local targets_json
-    targets_json="$(IFS=,; echo "[${targets[*]}]")"
+    # Reverse lookup: ask each target (PR / issue) which project items it
+    # has, instead of listing every item of every project of the owner.
+    # The old approach (gh project list + item-list --limit 200 + field-list
+    # per project) cost several hundred GraphQL points per project, because
+    # item-list pulls fieldValues(first:100) with nested labels/users/
+    # reviewers for every item — a couple of merges in a row was enough to
+    # trip GitHub's secondary rate limit. This single query costs ~1 point,
+    # and is scoped to $REPO by construction (no cross-repo matches, the
+    # Colibri/#24 bug). Aliases are t<N>; every N is a validated integer.
+    local selections="" t
+    for t in "${targets[@]}"; do
+        selections+="t${t}: issueOrPullRequest(number: ${t}) { ...Target } "
+    done
+    local query
+    query='query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) { '"$selections"'}
+}
+fragment Items on ProjectV2ItemConnection {
+  nodes {
+    id
+    isArchived
+    project {
+      id title closed
+      owner { ... on Organization { login } ... on User { login } }
+      fields(first: 50) {
+        nodes { ... on ProjectV2SingleSelectField { id name options { id name } } }
+      }
+    }
+  }
+}
+fragment Target on IssueOrPullRequest {
+  ... on Issue { number title url projectItems(first: 20) { ...Items } }
+  ... on PullRequest { number title url projectItems(first: 20) { ...Items } }
+}'
+
+    # gh exits non-zero when the response carries `errors` (e.g. a "#N" from
+    # the PR body that doesn't exist in this repo) but still prints the
+    # partial `data`, so keep stdout and judge by its content.
+    local response
+    response="$(gh api graphql -f query="$query" -f owner="$owner" -f name="${REPO#*/}" 2>/dev/null || true)"
+    if [[ -z "$response" ]] || ! echo "$response" | jq -e '.data.repository' >/dev/null 2>&1; then
+        info "Could not query project items for $REPO (missing 'project' scope?). Skipping."
+        info "  Grant it with: ${BOLD}gh auth refresh -s project,read:project${RESET}"
+        return 0
+    fi
 
     # Parallel arrays of candidate items. Each index is one item to (maybe)
     # move; CAND_SELECTED carries its toggle state.
@@ -1319,52 +1345,41 @@ update_project_item() {
     local -a CAND_ITEM_ID=() CAND_ITEM_URL=() CAND_ITEM_NUMBER=() CAND_ITEM_TITLE=()
     local -a CAND_SELECTED=()
 
-    local project_data project_number project_id project_title
-    local items fields status_field_id done_option_id done_option_name
-    local match_line item_id item_url item_number item_title
+    local project_title project_id status_field_id done_option_id done_option_name
+    local item_id item_url item_number item_title
 
-    while IFS= read -r project_data; do
-        project_number="$(echo "$project_data" | jq -r '.number')"
-        project_id="$(echo "$project_data" | jq -r '.id')"
-        project_title="$(echo "$project_data" | jq -r '.title')"
-
-        items="$(gh project item-list "$project_number" --owner "$owner" --format json --limit 200 2>/dev/null)" || continue
-        fields="$(gh project field-list "$project_number" --owner "$owner" --format json 2>/dev/null)" || continue
-
-        status_field_id="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].id // empty')"
-        [[ -z "$status_field_id" ]] && continue
-
-        done_option_id="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].options[]? | select((.name // "") | ascii_downcase == "done") | .id' | head -1)"
-        done_option_name="$(echo "$fields" | jq -r '[.fields[] | select((.name // "") | ascii_downcase == "status")][0].options[]? | select((.name // "") | ascii_downcase == "done") | .name' | head -1)"
-        [[ -z "$done_option_id" ]] && continue
-
-        # Critical scoping: only items whose .content.repository matches the
-        # current repo AND whose number is one of our targets. Without the
-        # repository filter, items with the same issue number in OTHER repos
-        # inside the same project would be moved (the Colibri/#24 bug).
-        while IFS= read -r match_line; do
-            [[ -z "$match_line" ]] && continue
-            IFS=$'\t' read -r item_id item_url item_number item_title <<< "$match_line"
-            [[ -z "$item_id" ]] && continue
-            CAND_PROJ_TITLE+=("$project_title")
-            CAND_PROJ_ID+=("$project_id")
-            CAND_FIELD_ID+=("$status_field_id")
-            CAND_OPTION_ID+=("$done_option_id")
-            CAND_OPTION_NAME+=("$done_option_name")
-            CAND_ITEM_ID+=("$item_id")
-            CAND_ITEM_URL+=("$item_url")
-            CAND_ITEM_NUMBER+=("$item_number")
-            CAND_ITEM_TITLE+=("$item_title")
-            CAND_SELECTED+=("true")
-        done < <(echo "$items" | jq -r \
-            --arg repo "$REPO" \
-            --argjson nums "$targets_json" \
-            '.items[]?
-             | select((.content.repository // "") == $repo)
-             | (.content.number // 0) as $n
-             | select($nums | index($n))
-             | "\(.id)\t\(.content.url // "")\t\($n)\t\(.content.title // "")"')
-    done <<< "$(echo "$projects" | jq -c '.projects[]?')"
+    # Same rules as before: open projects owned by the repo owner, with a
+    # "Status" single-select field that has a "Done" option (both matched
+    # case-insensitively). Archived items are left alone.
+    while IFS=$'\t' read -r project_title project_id status_field_id done_option_id done_option_name \
+                            item_id item_url item_number item_title; do
+        [[ -z "$item_id" ]] && continue
+        CAND_PROJ_TITLE+=("$project_title")
+        CAND_PROJ_ID+=("$project_id")
+        CAND_FIELD_ID+=("$status_field_id")
+        CAND_OPTION_ID+=("$done_option_id")
+        CAND_OPTION_NAME+=("$done_option_name")
+        CAND_ITEM_ID+=("$item_id")
+        CAND_ITEM_URL+=("$item_url")
+        CAND_ITEM_NUMBER+=("$item_number")
+        CAND_ITEM_TITLE+=("$item_title")
+        CAND_SELECTED+=("true")
+    done < <(echo "$response" | jq -r --arg owner "$owner" '
+        .data.repository | to_entries[] | .value // empty
+        | . as $t
+        | ($t.projectItems.nodes // [])[]
+        | select(.isArchived | not)
+        | select(.project.closed | not)
+        | select(((.project.owner.login // "") | ascii_downcase) == ($owner | ascii_downcase))
+        | . as $item
+        | ([.project.fields.nodes[]? | select((.name // "") | ascii_downcase == "status")][0]) as $status
+        | select($status != null)
+        | ([$status.options[]? | select((.name // "") | ascii_downcase == "done")][0]) as $done
+        | select($done != null)
+        | [ $item.project.title, $item.project.id, $status.id, $done.id, $done.name,
+            $item.id, ($t.url // ""), $t.number, ($t.title // "") ]
+        | map(tostring | gsub("[\t\n]"; " "))
+        | @tsv' 2>/dev/null)
 
     local total=${#CAND_ITEM_ID[@]}
     if [[ "$total" -eq 0 ]]; then
