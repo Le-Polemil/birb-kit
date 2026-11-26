@@ -235,6 +235,7 @@ COMMIT_TYPES=(
     "build|Build system"
     "ci|CI/CD"
     "revert|Revert"
+    "design|Design / UI"
 )
 
 # Resolves a commit-type choice (menu number or type name) to its canonical

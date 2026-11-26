@@ -16,6 +16,18 @@ cd birb-kit
 make install
 ```
 
+Upgrade a Homebrew install with `brew update && brew upgrade birb-kit`, a
+manual one with `git pull && make install` from the clone.
+
+Don't keep both. `make install` writes plain files to `/usr/local` (with
+`sudo` there), and an older copy there can shadow — or block — the Homebrew
+one. To switch to Homebrew, run `sudo make uninstall` from the clone first,
+then check `type -a birb` lists a single path.
+
+`birb --version` prints the latest `v*` tag the install was built from (e.g.
+`v0.4.7`, or `v0.4.7-2-gabc1234` past it), or `(unknown version)` when no tag
+information reached it.
+
 ## Commands
 
 | Command | Description |
@@ -161,3 +173,59 @@ throwaway PR in a personal repo:
 | Phantom conflict on merge | merge a PR whose head carries a squash-merged PR's commits | Diagnosis names the culprit PR, prints the `git rebase --onto` command, offers to run it, then retries the merge. |
 | Happy path | `birb merge <N>` end-to-end | Summary shows push ✔, PR closed ✔, issue closed ✔, project item moved ✔, thank-you posted ✔. |
 
+
+## Releasing
+
+A release is a `vX.Y.Z` git tag. The Homebrew formula lives in a separate
+tap, [Le-Polemil/homebrew-tools](https://github.com/Le-Polemil/homebrew-tools)
+(`Formula/birb-kit.rb`), and points at that tag's GitHub tarball — nothing
+reaches `brew` users until the formula is bumped.
+
+1. **Merge and tag** with birb itself. The repo has no version file, so the
+   version comes from the latest tag; the bump flag picks the next one, and
+   `birb merge` creates and pushes the tag:
+
+   ```bash
+   birb merge <PR> --feat --minor   # v0.4.7 → v0.5.0
+   birb merge <PR> --fix --patch    # v0.4.7 → v0.4.8
+   ```
+
+   Check the tag really exists before going on — the formula URL 404s
+   otherwise:
+
+   ```bash
+   git ls-remote --tags origin | tail -3
+   ```
+
+2. **Bump the formula.** This opens a PR on the tap with the new `url` and
+   its `sha256`:
+
+   ```bash
+   brew bump-formula-pr --url=https://github.com/Le-Polemil/birb-kit/archive/refs/tags/vX.Y.Z.tar.gz Le-Polemil/tools/birb-kit
+   ```
+
+   Or edit `url` and `sha256` by hand, getting the checksum with:
+
+   ```bash
+   curl -sL https://github.com/Le-Polemil/birb-kit/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+   ```
+
+3. **Merge the tap PR**, then upgrade:
+
+   ```bash
+   brew update && brew upgrade birb-kit
+   ```
+
+   If `brew info le-polemil/tools/birb-kit` still shows the old version,
+   pull the tap directly:
+   `git -C "$(brew --repository le-polemil/tools)" pull`.
+
+4. **Verify:**
+
+   ```bash
+   birb --version
+   ```
+
+   The version reaches the tarball through `export-subst` (see
+   `.gitattributes`), which fills the `$Format:…$` placeholder in `bin/birb`
+   when GitHub builds the archive.
